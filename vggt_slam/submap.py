@@ -22,7 +22,10 @@ class Submap:
         self.pointclouds = None # (S, H, W, 3)
         self.voxelized_points = None
         self.last_non_loop_frame_index = None
+        # Existing VGGT frame identifiers for attribution/logging, never Go2
+        # source timestamps. Source metadata lives in keyframe_records.
         self.frame_ids = None
+        self.keyframe_records = None
         self.is_lc_submap = False
         self.img_names = []
         self.semantic_vectors = []
@@ -41,7 +44,7 @@ class Submap:
         self.proj_mats = intrinsics_inv
     
     def set_img_names(self, img_names):
-        self.img_names = img_names
+        self.img_names = list(img_names)
             
     def add_all_frames(self, frames):
         self.frames = frames
@@ -147,6 +150,44 @@ class Submap:
             else:
                 raise ValueError(f"No number found in image name: {filename}")
         self.frame_ids = frame_ids
+
+    def set_explicit_frame_ids(self, frame_ids):
+        """Set existing VGGT frame identifiers without parsing image paths.
+
+        This is for realtime metadata whose timestamp-named paths cannot encode
+        the local VGGT frame identity. These IDs are not Go2 timestamps.
+        """
+        self.frame_ids = list(frame_ids)
+
+    def set_keyframe_records(self, records):
+        records = list(records)
+        if self.frame_ids is None or len(records) != len(self.frame_ids):
+            raise ValueError("Keyframe records and frame IDs must have the same length")
+        if len(records) != len(self.img_names):
+            raise ValueError("Keyframe records and image names must have the same length")
+        for index, record in enumerate(records):
+            if record.image_path != self.img_names[index]:
+                raise ValueError("Keyframe record image path does not match submap image name")
+            if record.frame_id != self.frame_ids[index]:
+                raise ValueError("Keyframe record frame ID does not match submap frame ID")
+            if record.timestamp_ns is not None:
+                if not isinstance(record.timestamp_ns, int):
+                    raise TypeError("Go2 timestamp_ns must be an exact Python int")
+                if record.metric_pose is None:
+                    raise ValueError("Go2 keyframe record is missing its metric pose")
+        self.keyframe_records = records
+
+    def get_keyframe_records(self):
+        return self.keyframe_records
+
+    def get_keyframe_record_at_index(self, index):
+        if self.keyframe_records is None:
+            return None
+        return self.keyframe_records[index]
+
+    def get_metric_pose_at_index(self, index):
+        record = self.get_keyframe_record_at_index(index)
+        return None if record is None else record.metric_pose
 
     def set_last_non_loop_frame_index(self, last_non_loop_frame_index):
         self.last_non_loop_frame_index = last_non_loop_frame_index

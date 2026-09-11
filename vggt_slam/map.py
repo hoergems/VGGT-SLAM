@@ -110,6 +110,24 @@ class GraphMap:
     def get_submaps(self):
         return self.submaps.values()
 
+    def get_keyframe_record_by_timestamp(self, timestamp_ns):
+        """Return canonical Go2 metadata for an exact source timestamp."""
+        if not isinstance(timestamp_ns, int):
+            raise TypeError("timestamp_ns must be an exact Python int")
+        matches = []
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+            for record in submap.get_keyframe_records() or []:
+                if record.timestamp_ns == timestamp_ns:
+                    matches.append(record)
+        if not matches:
+            return None
+        canonical = matches[0]
+        if any(record != canonical for record in matches[1:]):
+            raise ValueError(f"Conflicting metadata for timestamp {timestamp_ns}")
+        return canonical
+
     def ordered_submaps_by_key(self):
         for k in sorted(self.submaps):
             yield self.submaps[k]
@@ -159,7 +177,32 @@ class GraphMap:
                     else:
                         quaternion = R.from_matrix(rotation_matrix).as_quat() # x, y, z, w
                         output = np.array([float(frame_id), x, y, z, *quaternion])
-                    f.write(" ".join(f"{v:.8f}" for v in output) + "\n")    
+                    f.write(" ".join(f"{v:.8f}" for v in output) + "\n")
+
+    def write_timestamped_poses_to_file(self, file_name, graph, give_camera_mat=False):
+        """Write Go2 timestamp and VGGT pose pairs without changing legacy logs."""
+        all_poses = self.get_all_cam_matricies(give_camera_mat=True, graph=graph)
+        with open(file_name, "w") as f:
+            count = 0
+            for submap in self.ordered_submaps_by_key():
+                if submap.get_lc_status():
+                    continue
+                for frame_index, _ in enumerate(submap.get_frame_ids()):
+                    pose = all_poses[count]
+                    count += 1
+                    record = submap.get_keyframe_record_at_index(frame_index)
+                    if record is None or record.timestamp_ns is None:
+                        continue
+                    if not isinstance(record.timestamp_ns, int):
+                        raise TypeError("timestamp_ns must be an exact Python int")
+                    _, rotation_matrix, t, _ = decompose_camera(pose)
+                    quaternion = R.from_matrix(rotation_matrix).as_quat()
+                    f.write(
+                        str(record.timestamp_ns)
+                        + " "
+                        + " ".join(f"{value:.8f}" for value in (*t, *quaternion))
+                        + "\n"
+                    )
 
     def write_points_to_file(self, graph, file_name):
         pcd_all = []

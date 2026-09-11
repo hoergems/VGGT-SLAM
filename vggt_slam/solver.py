@@ -274,7 +274,14 @@ class Solver:
             lc_submap = Submap(lc_submap_num)
             lc_submap.set_lc_status(True)
             lc_submap.add_all_frames(pred_dict["frames_lc"])
-            lc_submap.set_frame_ids(pred_dict["frames_lc_names"])
+            if pred_dict.get("frames_lc_records") is not None:
+                lc_records = pred_dict["frames_lc_records"]
+                lc_submap.set_explicit_frame_ids([record.frame_id for record in lc_records])
+                lc_submap.set_img_names([record.image_path for record in lc_records])
+                lc_submap.set_keyframe_records(lc_records)
+            else:
+                lc_submap.set_frame_ids(pred_dict["frames_lc_names"])
+                lc_submap.set_img_names(pred_dict["frames_lc_names"])
             lc_submap.set_last_non_loop_frame_index(1)
 
             lc_submap.add_all_poses(world_to_cam_lc)
@@ -297,7 +304,14 @@ class Solver:
         pixel_coords = torch.stack((y_coords, x_coords), dim=1)
         return pixel_coords
 
-    def run_predictions(self, image_names, model, max_loops, clip_model, clip_preprocess):
+    def run_predictions(self, image_names, model, max_loops, clip_model, clip_preprocess,
+                        keyframe_records=None):
+        if keyframe_records is not None:
+            if len(keyframe_records) != len(image_names):
+                raise ValueError("Keyframe records and image names must have the same length")
+            for record, image_name in zip(keyframe_records, image_names):
+                if record.image_path != image_name:
+                    raise ValueError("Keyframe record image path does not match image_names")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         t1 = time.time()
         with self.vggt_timer:
@@ -318,10 +332,15 @@ class Solver:
         t1 = time.time()
         new_submap = Submap(new_pcd_num)
         new_submap.add_all_frames(images)
-        new_submap.set_frame_ids(image_names)
+        if keyframe_records is None:
+            new_submap.set_frame_ids(image_names)
+        else:
+            new_submap.set_explicit_frame_ids([record.frame_id for record in keyframe_records])
         new_submap.set_last_non_loop_frame_index(images.shape[0] - 1)
         new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
         new_submap.set_img_names(image_names)
+        if keyframe_records is not None:
+            new_submap.set_keyframe_records(keyframe_records)
 
         with self.clip_timer:
             if clip_model is not None and clip_preprocess is not None:
@@ -342,6 +361,7 @@ class Solver:
         with self.loop_closure_timer:
             detected_loops = self.image_retrieval.find_loop_closures(self.map, new_submap, max_loop_closures=max_loops, max_similarity_thres=self.lc_thres)
         loop_closure_frame_names = []
+        loop_closure_records = None
         if len(detected_loops) > 0:
             print(colored("detected_loops", "yellow"), detected_loops)
             retrieved_frames = self.map.get_frames_from_loops(detected_loops)
@@ -350,6 +370,12 @@ class Solver:
                 predictions_lc = model(lc_frames, compute_similarity=True)
                 loop_closure_frame_names = [new_submap.get_img_names_at_index(detected_loops[0].query_submap_frame), 
                 self.map.get_submap(detected_loops[0].detected_submap_id).get_img_names_at_index(detected_loops[0].detected_submap_frame)]
+                query_record = new_submap.get_keyframe_record_at_index(detected_loops[0].query_submap_frame)
+                detected_record = self.map.get_submap(detected_loops[0].detected_submap_id).get_keyframe_record_at_index(detected_loops[0].detected_submap_frame)
+                if query_record is not None or detected_record is not None:
+                    if query_record is None or detected_record is None:
+                        raise ValueError("Loop closure metadata is present for only one selected frame")
+                    loop_closure_records = [query_record, detected_record]
 
             # Visualize loop closure frames
             if DEBUG:
@@ -392,5 +418,6 @@ class Solver:
             predictions["frames_lc"] = lc_frames[0:2,...]
             print(loop_closure_frame_names)
             predictions["frames_lc_names"] = loop_closure_frame_names
+            predictions["frames_lc_records"] = loop_closure_records
 
         return predictions

@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import argparse
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -10,7 +11,8 @@ from torchvision.transforms.functional import to_pil_image
 
 import vggt_slam.slam_utils as utils
 from vggt_slam.solver import Solver
-from vggt_slam.cameras import BACKENDS
+from vggt_slam.cameras import BACKENDS, CameraFrame
+from vggt_slam.frame_metadata import KeyframeRecord
 
 from vggt.models.vggt import VGGT
 
@@ -35,16 +37,166 @@ parser.add_argument("--lc_thres", type=float, default=0.95, help="Threshold for 
 parser.add_argument("--log_results", action="store_true", help="save txt file with results")
 parser.add_argument("--skip_dense_log", action="store_true", help="by default, logging poses and logs dense point clouds. If this flag is set, dense logging is skipped")
 parser.add_argument("--log_path", type=str, default="poses.txt", help="Path to save the log file")
+parser.add_argument("--phase4_debug", action="store_true", help="Print temporary Phase 4 Go2 metadata integrity diagnostics for newly added submaps")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def save_keyframe(img: np.ndarray, folder: str, idx: int) -> str:
-    filename = os.path.join(folder, f"frame_{idx:06d}.png")
-    cv2.imwrite(filename, img)
-    return filename
+def save_keyframe(frame: CameraFrame, folder: str, frame_count: int) -> KeyframeRecord:
+    """Persist one keyframe while retaining its source identity and metadata."""
+    if frame.timestamp_ns is not None:
+        if not isinstance(frame.timestamp_ns, int):
+            raise TypeError("Go2 timestamp_ns must be an exact Python int")
+        filename = os.path.join(folder, f"{frame.timestamp_ns}.png")
+    else:
+        filename = os.path.join(folder, f"frame_{frame_count:06d}.png")
+    if not cv2.imwrite(filename, frame.image):
+        raise IOError(f"Failed to save keyframe to {filename}")
+    record = KeyframeRecord(
+        image_path=filename,
+        # This is the pre-existing local VGGT realtime identity, deliberately
+        # separate from the Go2 source timestamp used in the filename.
+        frame_id=frame_count,
+        timestamp_ns=frame.timestamp_ns,
+        metric_pose=frame.metric_pose,
+        sequence_id=frame.sequence_id,
+    )
+    if record.timestamp_ns is not None:
+        if record.metric_pose is None:
+            raise ValueError("Go2 keyframe metadata is incomplete or inconsistent")
+    return record
+
+
+def _phase4_record_errors(frame_id, record, image_name, lookup_record):
+    """Return metadata consistency errors for one Go2 keyframe record."""
+    errors = []
+    if record.frame_id != frame_id:
+        errors.append("frame ID mismatch")
+    if type(record.timestamp_ns) is not int:
+        errors.append("timestamp type mismatch")
+    if image_name is None or Path(image_name).stem != str(record.timestamp_ns):
+        errors.append("filename/timestamp mismatch")
+    if type(record.timestamp_ns) is int:
+        if lookup_record != record:
+            errors.append("timestamp lookup mismatch")
+    if record.image_path != image_name:
+        errors.append("record/image mismatch")
+    if record.metric_pose is None:
+        errors.append("missing metric pose")
+    return errors
+
+
+def _print_phase4_submap_records(solver, submap, label):
+    """Print and validate the metadata records belonging to one submap."""
+    frame_ids = submap.get_frame_ids()
+    records = submap.get_keyframe_records()
+
+    if not records or not any(record.timestamp_ns is not None for record in records):
+        print("[Phase4Check]   no keyframe metadata; skipping Go2 checks")
+        return
+
+    errors = []
+    if frame_ids is None or len(frame_ids) != len(records):
+        frame_count = 0 if frame_ids is None else len(frame_ids)
+        errors.append(f"frame ID/record count mismatch ({frame_count}/{len(records)})")
+
+    image_names = []
+    for index in range(len(records)):
+        try:
+            image_names.append(submap.get_img_names_at_index(index))
+        except IndexError:
+            errors.append(f"index {index}: missing image name")
+            image_names.append(None)
+    image_count = sum(image_name is not None for image_name in image_names)
+    if image_count != len(records):
+        errors.append(f"image/record count mismatch ({image_count}/{len(records)})")
+
+    for index, record in enumerate(records):
+        if record.timestamp_ns is None:
+            print(f"[Phase4Check]   i={index:02d} no Go2 metadata; skipping")
+            continue
+
+        frame_id = frame_ids[index] if frame_ids is not None and index < len(frame_ids) else None
+        image_name = image_names[index]
+        lookup_record = None
+        if type(record.timestamp_ns) is int:
+            lookup_record = solver.map.get_keyframe_record_by_timestamp(record.timestamp_ns)
+        record_errors = _phase4_record_errors(frame_id, record, image_name, lookup_record)
+        errors.extend(f"index {index}: {error}" for error in record_errors)
+        image_basename = Path(image_name).name if image_name is not None else "<missing>"
+        metric_pose = "yes" if record.metric_pose is not None else "no"
+        lookup = "ok" if lookup_record == record else "mismatch"
+        print(
+            f"[Phase4Check]   i={index:02d} frame_id={frame_id} "
+            f"timestamp_ns={record.timestamp_ns} image={image_basename} "
+            f"metric_pose={metric_pose} lookup={lookup}"
+        )
+
+    if errors:
+        print(f"[Phase4Check]   FAIL: {len(errors)} metadata inconsistencies")
+        for error in errors:
+            print(f"[Phase4Check]     - {error}")
+    else:
+        if label == "loop-closure":
+            print("[Phase4Check]   PASS: loop-closure metadata preserved")
+        else:
+            print(f"[Phase4Check]   PASS: {len(records)}/{len(records)} records consistent")
+
+
+def _print_phase4_overlap_diagnostics(solver, current_submap):
+    """Validate the configured one-frame overlap with the preceding normal submap."""
+    normal_submaps = [
+        submap for submap in solver.map.ordered_submaps_by_key()
+        if not submap.get_lc_status()
+    ]
+    try:
+        current_index = normal_submaps.index(current_submap)
+    except ValueError:
+        return
+    if current_index == 0:
+        return
+
+    previous = normal_submaps[current_index - 1]
+    previous_records = previous.get_keyframe_records()
+    current_records = current_submap.get_keyframe_records()
+    if not previous_records or not current_records:
+        print("[Phase4Check] Overlap metadata unavailable; skipping Go2 check")
+        return
+
+    previous_last = previous_records[-1]
+    current_first = current_records[0]
+    print(
+        f"[Phase4Check] Overlap previous={previous.get_id()} "
+        f"current={current_submap.get_id()}:"
+    )
+    print(f"[Phase4Check]   prev_last_timestamp_ns={previous_last.timestamp_ns}")
+    print(f"[Phase4Check]   curr_first_timestamp_ns={current_first.timestamp_ns}")
+    if (
+        type(previous_last.timestamp_ns) is int
+        and previous_last.timestamp_ns == current_first.timestamp_ns
+        and previous_last == current_first
+    ):
+        print("[Phase4Check]   PASS: overlap metadata identical")
+    else:
+        print("[Phase4Check]   FAIL: overlap metadata mismatch")
+
+
+def print_phase4_submap_diagnostics(solver, new_submap_ids):
+    """Print temporary Phase 4 metadata diagnostics for submaps just added to the map."""
+    for submap_id in new_submap_ids:
+        submap = solver.map.get_submap(submap_id)
+        is_loop_closure = submap.get_lc_status()
+        frame_ids = submap.get_frame_ids()
+        frame_count = 0 if frame_ids is None else len(frame_ids)
+        if is_loop_closure:
+            print(f"[Phase4Check] Loop-closure submap id={submap_id} frames={frame_count}")
+            _print_phase4_submap_records(solver, submap, "loop-closure")
+        else:
+            print(f"[Phase4Check] Submap id={submap_id} lc=False frames={frame_count}")
+            _print_phase4_submap_records(solver, submap, "normal")
+            _print_phase4_overlap_diagnostics(solver, submap)
 
 
 def restart_camera(camera, stop_event=None, retry_delay: float = 2.0):
@@ -75,16 +227,29 @@ def restart_camera(camera, stop_event=None, retry_delay: float = 2.0):
     return None
 
 
-def threaded_process_submap(image_names_subset, solver, model, args, clip_model, clip_preprocess):
+def threaded_process_submap(keyframe_records, solver, model, args, clip_model, clip_preprocess):
     """Background thread: run VGGT inference + graph optimisation for one submap."""
     try:
-        print(f"[SLAM] Processing submap ({len(image_names_subset)} frames)...")
+        image_names = [record.image_path for record in keyframe_records]
+        print(f"[SLAM] Processing submap ({len(keyframe_records)} frames)...")
         predictions = solver.run_predictions(
-            image_names_subset, model, args.max_loops, clip_model, clip_preprocess
+            image_names, model, args.max_loops, clip_model, clip_preprocess,
+            keyframe_records=keyframe_records,
         )
         with data_lock:
+            before_ids = {
+                submap.get_id()
+                for submap in solver.map.get_submaps()
+            }
             solver.add_points(predictions)
             solver.graph.optimize()
+            after_ids = {
+                submap.get_id()
+                for submap in solver.map.get_submaps()
+            }
+            new_submap_ids = sorted(after_ids - before_ids)
+            if args.phase4_debug:
+                print_phase4_submap_diagnostics(solver, new_submap_ids)
             if args.vis_map:
                 if len(predictions.get("detected_loops", [])) > 0:
                     solver.update_all_submap_vis()
@@ -212,12 +377,12 @@ def main():
             camera = restart_camera(camera)
 
     if use_display:
-        cv2.imshow("VGGT-SLAM Live", first_frame)
+        cv2.imshow("VGGT-SLAM Live", first_frame.image)
         cv2.waitKey(1)
     print("Camera ready.")
 
     frame_count = 0
-    image_names_subset = []
+    keyframe_records = []
     target_size = args.submap_size + args.overlapping_window_size
     submap_count = 0
     last_status_frame = 0  # for console status throttle when display is off
@@ -229,7 +394,7 @@ def main():
                 break
 
             try:
-                img = camera.capture()
+                frame = camera.capture()
             except Exception as e:
                 print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
                 camera = restart_camera(camera, stop_event)
@@ -237,32 +402,41 @@ def main():
                     break
                 continue
 
-            if img is None:
+            if frame is None:
                 continue
+
+            img = frame.image
 
             frame_count += 1
 
             if solver.flow_tracker.compute_disparity(img, args.min_disparity, args.vis_flow):
-                frame_path = save_keyframe(img, args.keyframe_folder, frame_count)
-                image_names_subset.append(frame_path)
+                keyframe_records.append(save_keyframe(frame, args.keyframe_folder, frame_count))
 
-            if len(image_names_subset) >= target_size:
+            if len(keyframe_records) >= target_size:
                 if solver_lock.acquire(blocking=False):
                     submap_count += 1
                     print(f"[Main] Launching submap {submap_count} (frame {frame_count})...")
+                    go2_records = [record for record in keyframe_records if record.timestamp_ns is not None]
+                    if go2_records:
+                        print(
+                            f"[Main]   frames={len(keyframe_records)} "
+                            f"first_timestamp_ns={go2_records[0].timestamp_ns} "
+                            f"last_timestamp_ns={go2_records[-1].timestamp_ns} "
+                            f"metric_poses={sum(record.metric_pose is not None for record in go2_records)}/{len(go2_records)}"
+                        )
                     t = threading.Thread(
                         target=threaded_process_submap,
-                        args=(list(image_names_subset), solver, model, args, clip_model, clip_preprocess),
+                        args=(list(keyframe_records), solver, model, args, clip_model, clip_preprocess),
                         daemon=True,
                     )
                     t.start()
-                    image_names_subset = image_names_subset[-args.overlapping_window_size:]
+                    keyframe_records = keyframe_records[-args.overlapping_window_size:]
                 else:
                     # SLAM still busy; cap the backlog so we don't grow unbounded.
-                    if len(image_names_subset) > target_size * 2:
-                        image_names_subset = image_names_subset[-target_size:]
+                    if len(keyframe_records) > target_size * 2:
+                        keyframe_records = keyframe_records[-target_size:]
 
-            kf = len(image_names_subset)
+            kf = len(keyframe_records)
             slam_busy = solver_lock.locked()
 
             if use_display:

@@ -72,6 +72,15 @@ chmod +x setup.sh
 
 ---
 
+## Run using images from GO2
+
+```bash
+python3 main_realtime.py \
+     --camera go2 \
+     --max_loops 1 \
+     --vis_map
+```
+
 ## Quick Start
 
 run `python main.py --image_folder /path/to/image/folder --max_loops 1 --vis_map` replacing the image path with your folder of images. 

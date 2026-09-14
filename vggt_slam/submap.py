@@ -29,6 +29,7 @@ class Submap:
         self.is_lc_submap = False
         self.img_names = []
         self.semantic_vectors = []
+        self.incoming_scale_factor = None
     
     def set_lc_status(self, is_lc_submap):
         self.is_lc_submap = is_lc_submap
@@ -57,6 +58,15 @@ class Submap:
     
     def get_id(self):
         return self.submap_id
+
+    def set_incoming_scale_factor(self, scale_factor):
+        scale_factor = float(scale_factor)
+        if not np.isfinite(scale_factor) or scale_factor <= 0.0:
+            raise ValueError("incoming scale factor must be finite and positive")
+        self.incoming_scale_factor = scale_factor
+
+    def get_incoming_scale_factor(self):
+        return self.incoming_scale_factor
 
     def get_conf_threshold(self):
         return self.conf_threshold
@@ -113,6 +123,26 @@ class Submap:
 
     def get_all_poses(self):
         return self.poses
+
+    def get_local_camera_centers(self) -> np.ndarray:
+        """Return local VGGT camera centers, before any graph transformation."""
+        if self.poses is None:
+            raise ValueError("local VGGT poses are not available")
+        centers = []
+        for index, world_to_cam in enumerate(self.poses):
+            world_to_cam = np.asarray(world_to_cam, dtype=float)
+            if world_to_cam.shape != (4, 4):
+                raise ValueError(f"local VGGT pose {index} must have shape (4, 4)")
+            if not np.isfinite(world_to_cam).all():
+                raise ValueError(f"local VGGT pose {index} contains non-finite values")
+            try:
+                center = np.linalg.inv(world_to_cam)[:3, 3]
+            except np.linalg.LinAlgError as error:
+                raise ValueError(f"local VGGT pose {index} is not invertible") from error
+            if not np.isfinite(center).all():
+                raise ValueError(f"local VGGT camera center {index} contains non-finite values")
+            centers.append(center)
+        return np.asarray(centers, dtype=float).reshape(-1, 3)
 
     def get_all_poses_world(self, graph, give_camera_mat=False):
         homography_list = [graph.get_homography(i + self.get_id()) for i in range(len(self.poses))]

@@ -38,6 +38,13 @@ parser.add_argument("--log_results", action="store_true", help="save txt file wi
 parser.add_argument("--skip_dense_log", action="store_true", help="by default, logging poses and logs dense point clouds. If this flag is set, dense logging is skipped")
 parser.add_argument("--log_path", type=str, default="poses.txt", help="Path to save the log file")
 parser.add_argument("--phase4_debug", action="store_true", help="Print temporary Phase 4 Go2 metadata integrity diagnostics for newly added submaps")
+parser.add_argument("--metric_trajectory_path", type=str, default=None, help="Write unique Go2 metric keyframe trajectory as: timestamp_ns x y z qx qy qz qw")
+parser.add_argument("--vggt_trajectory_path", type=str, default=None, help="Write unique timestamped optimized VGGT camera trajectory as: timestamp_ns x y z qx qy qz qw")
+parser.add_argument("--vggt_trajectory_plot_path", type=str, default=None, help="Write an XY diagnostic plot of the unaligned VGGT camera trajectory")
+parser.add_argument("--map_output_path", type=str, default=None, help="Write the final optimized colored VGGT point cloud to this file (recommended: .ply)")
+parser.add_argument("--submap_diagnostics_path", type=str, default=None, help="Write per-submap VGGT-versus-Go2 diagnostics as CSV")
+parser.add_argument("--submap_diagnostics_plot_path", type=str, default=None, help="Write a per-submap scale and error diagnostic plot")
+parser.add_argument("--submap_point_cloud_dir", type=str, default=None, help="Write each ordinary optimized submap as a PLY in this directory")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +484,33 @@ def main():
 
     if args.run_os:
         run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor)
+
+    if args.metric_trajectory_path is not None:
+        solver.map.write_metric_camera_trajectory_to_file(args.metric_trajectory_path)
+
+    if args.vggt_trajectory_path is not None or args.vggt_trajectory_plot_path is not None:
+        vggt_trajectory = solver.map.get_vggt_camera_trajectory(solver.graph)
+        if args.vggt_trajectory_path is not None:
+            solver.map.write_timestamped_poses_to_file(
+                args.vggt_trajectory_path,
+                solver.graph,
+                samples=vggt_trajectory,
+            )
+        if args.vggt_trajectory_plot_path is not None:
+            solver.map.plot_vggt_camera_trajectory(vggt_trajectory, args.vggt_trajectory_plot_path)
+
+    if args.map_output_path is not None:
+        solver.map.write_points_to_file(solver.graph, args.map_output_path)
+
+    if args.submap_diagnostics_path is not None or args.submap_diagnostics_plot_path is not None:
+        diagnostics = solver.map.print_submap_trajectory_diagnostics(solver.graph)
+        if args.submap_diagnostics_path is not None:
+            solver.map.write_submap_trajectory_diagnostics_to_csv(diagnostics, args.submap_diagnostics_path)
+        if args.submap_diagnostics_plot_path is not None:
+            solver.map.plot_submap_scale_diagnostics(diagnostics, args.submap_diagnostics_plot_path)
+
+    if args.submap_point_cloud_dir is not None:
+        solver.map.write_submap_point_clouds(solver.graph, args.submap_point_cloud_dir)
 
     if args.log_results:
         solver.map.write_poses_to_file(args.log_path, solver.graph, kitti_format=False)

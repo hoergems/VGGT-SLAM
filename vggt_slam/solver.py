@@ -145,6 +145,8 @@ class Solver:
             scale_factor_est_output = estimate_scale_pairwise(t1, t2)
             print(colored("scale factor", 'green'), scale_factor_est_output)
             scale_factor = scale_factor_est_output[0]
+            if not is_loop_closure and not current_submap.get_lc_status():
+                current_submap.set_incoming_scale_factor(scale_factor)
             H_scale = np.diag((scale_factor, scale_factor, scale_factor, 1.0))
 
             if DEBUG:

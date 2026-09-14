@@ -74,8 +74,17 @@ chmod +x setup.sh
 
 ## Run using images from GO2
 
+Run the go_vggt_bridge:
+
 ```bash
-python3 main_realtime.py \
+source ~/unitree_ros2/src/scripts/setup_local.sh
+ros2 launch go2_vggt_bridge go2_vggt_bridge.launch.py
+```
+
+Run main_realtime:
+
+```bash
+python main_realtime.py \
      --camera go2 \
      --max_loops 1 \
      --vis_map

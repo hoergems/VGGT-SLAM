@@ -1,6 +1,6 @@
 torch==2.3.1
 torchvision==0.18.1
-numpy
+numpy==1.26.4
 Pillow
 open3d
 huggingface_hub
@@ -13,8 +13,7 @@ gradio
 viser==0.2.23
 tqdm
 omegaconf
-opencv-python
-pyzmq
+opencv-python==4.11.0.86
 scipy
 requests
 trimesh

@@ -2,6 +2,7 @@ import os
 import glob
 import time
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -26,12 +27,27 @@ parser.add_argument("--vis_flow", action="store_true", help="Visualize optical f
 parser.add_argument("--log_results", action="store_true", help="save txt file with results")
 parser.add_argument("--skip_dense_log", action="store_true", help="by default, logging poses and logs dense point clouds. If this flag is set, dense logging is skipped")
 parser.add_argument("--log_path", type=str, default="poses.txt", help="Path to save the log file")
+parser.add_argument(
+    "--map_output_path",
+    type=str,
+    default=None,
+    help="Optional path for saving the final optimized point cloud (e.g. map.ply)",
+)
 parser.add_argument("--submap_size", type=int, default=16, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
 parser.add_argument("--overlapping_window_size", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW. Number of overlapping frames, which are used in SL(4) estimation")
 parser.add_argument("--max_loops", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW or 0 to disable loop closures.")
 parser.add_argument("--min_disparity", type=float, default=50, help="Minimum disparity to generate a new keyframe")
 parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
 parser.add_argument("--lc_thres", type=float, default=0.95, help="Threshold for image retrieval. Range: [0, 1.0]. Higher = more loop closures")
+
+
+def _export_requested_map(solver, map_output_path):
+    """Write the final optimized map for an explicit standalone export request."""
+    if map_output_path is None:
+        return
+
+    Path(map_output_path).parent.mkdir(parents=True, exist_ok=True)
+    solver.map.write_points_to_file(solver.graph, map_output_path)
 
 
 def main():
@@ -147,6 +163,7 @@ def main():
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())
 
+    _export_requested_map(solver, args.map_output_path)
 
     if args.run_os:
         # Register the viser object-query panel so the user can search for

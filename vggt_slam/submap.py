@@ -7,6 +7,57 @@ import scipy
 import open3d as o3d
 from vggt_slam.slam_utils import decompose_camera
 
+
+def transform_points_homogeneous(points, transform, *, context):
+    """Apply a finite, invertible homogeneous transform to ``(..., 3)`` points."""
+    points = np.asarray(points, dtype=float)
+    transform = np.asarray(transform, dtype=float)
+    if points.ndim < 1 or points.shape[-1:] != (3,):
+        raise ValueError(f"{context} points must have shape (..., 3)")
+    if not np.isfinite(points).all():
+        raise ValueError(f"{context} points contain non-finite values")
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError(f"{context} transform must be a finite (4, 4) matrix")
+    try:
+        if abs(np.linalg.det(transform)) <= 1e-12:
+            raise ValueError(f"{context} transform is singular")
+    except np.linalg.LinAlgError as error:
+        raise ValueError(f"{context} transform is not invertible") from error
+    flat = points.reshape(-1, 3)
+    homogeneous = np.column_stack((flat, np.ones(len(flat), dtype=float)))
+    transformed = (transform @ homogeneous.T).T
+    w = transformed[:, 3]
+    if np.any(~np.isfinite(w)) or np.any(np.abs(w) <= 1e-12):
+        raise ValueError(f"{context} transform produced a near-zero homogeneous denominator")
+    result = transformed[:, :3] / w[:, None]
+    if not np.isfinite(result).all():
+        raise ValueError(f"{context} transform produced non-finite points")
+    return result.reshape(points.shape)
+
+
+def _describe_local_pose_linear_part(world_to_cam):
+    """Describe the inverse-pose linear part when it is not an SO(3) rotation."""
+    cam_to_world = np.linalg.inv(world_to_cam)
+    linear_part = cam_to_world[:3, :3]
+    orthogonality_error = np.max(
+        np.abs(linear_part.T @ linear_part - np.eye(3))
+    )
+    return {
+        "determinant": float(np.linalg.det(linear_part)),
+        "singular_values": np.linalg.svd(linear_part, compute_uv=False),
+        "max_orthogonality_error": float(orthogonality_error),
+    }
+
+
+def _is_proper_rotation(rotation, atol=1e-6):
+    return (
+        rotation.shape == (3, 3)
+        and np.isfinite(rotation).all()
+        and np.allclose(rotation.T @ rotation, np.eye(3), atol=atol)
+        and np.isclose(np.linalg.det(rotation), 1.0, atol=atol)
+    )
+
+
 class Submap:
     def __init__(self, submap_id):
         self.submap_id = submap_id
@@ -30,6 +81,7 @@ class Submap:
         self.img_names = []
         self.semantic_vectors = []
         self.incoming_scale_factor = None
+        self.window_metadata = None
     
     def set_lc_status(self, is_lc_submap):
         self.is_lc_submap = is_lc_submap
@@ -67,6 +119,15 @@ class Submap:
 
     def get_incoming_scale_factor(self):
         return self.incoming_scale_factor
+
+    def set_window_metadata(self, metadata):
+        """Store online window-policy metadata for an ordinary submap."""
+        if self.is_lc_submap:
+            raise ValueError("window metadata must not be attached to loop-closure submaps")
+        self.window_metadata = metadata
+
+    def get_window_metadata(self):
+        return self.window_metadata
 
     def get_conf_threshold(self):
         return self.conf_threshold
@@ -144,6 +205,96 @@ class Submap:
             centers.append(center)
         return np.asarray(centers, dtype=float).reshape(-1, 3)
 
+    def get_local_camera_orientations(self) -> np.ndarray:
+        """Return local VGGT camera-to-world rotations from camera matrices."""
+        projections = self.get_local_camera_projection_matrices()
+        rotations = []
+        for index, projection in enumerate(projections):
+            try:
+                _, rotation, _, _ = decompose_camera(projection[:3, :])
+            except (AssertionError, ValueError, np.linalg.LinAlgError) as error:
+                raise ValueError(
+                    f"failed to decompose local camera orientation for submap "
+                    f"{self.get_id()} frame {index}"
+                ) from error
+            if not _is_proper_rotation(rotation):
+                raise ValueError(
+                    f"decomposed local camera orientation for submap {self.get_id()} "
+                    f"frame {index} is not a proper rotation"
+                )
+            rotations.append(rotation)
+        return np.asarray(rotations, dtype=float).reshape(-1, 3, 3)
+
+    def get_local_camera_projection_matrices(self) -> np.ndarray:
+        """Return local ``K_4x4 @ world_to_cam`` camera projection matrices.
+
+        ``poses`` stores local world-to-camera transforms and ``proj_mats``
+        stores their corresponding 4x4 intrinsic matrices, despite the legacy
+        ``intrinsics_inv`` argument name in :meth:`add_all_points`.
+        """
+        if self.poses is None:
+            raise ValueError(f"local VGGT poses are not available for submap {self.get_id()}")
+        if self.proj_mats is None:
+            raise ValueError(f"local VGGT intrinsics are not available for submap {self.get_id()}")
+        if len(self.poses) != len(self.proj_mats):
+            raise ValueError(
+                f"local VGGT pose and intrinsic counts differ for submap {self.get_id()}: "
+                f"{len(self.poses)} poses and {len(self.proj_mats)} intrinsics"
+            )
+
+        projections = []
+        for index, (world_to_cam, intrinsics_4x4) in enumerate(zip(self.poses, self.proj_mats)):
+            world_to_cam = np.asarray(world_to_cam, dtype=float)
+            intrinsics_4x4 = np.asarray(intrinsics_4x4, dtype=float)
+            if world_to_cam.shape != (4, 4):
+                raise ValueError(
+                    f"local VGGT pose for submap {self.get_id()} frame {index} "
+                    "must have shape (4, 4)"
+                )
+            if intrinsics_4x4.shape != (4, 4):
+                raise ValueError(
+                    f"local VGGT intrinsics for submap {self.get_id()} frame {index} "
+                    "must have shape (4, 4)"
+                )
+            if not np.isfinite(world_to_cam).all():
+                raise ValueError(
+                    f"local VGGT pose for submap {self.get_id()} frame {index} "
+                    "contains non-finite values"
+                )
+            if not np.isfinite(intrinsics_4x4).all():
+                raise ValueError(
+                    f"local VGGT intrinsics for submap {self.get_id()} frame {index} "
+                    "contain non-finite values"
+                )
+            if abs(np.linalg.det(intrinsics_4x4[:3, :3])) <= 1e-12:
+                raise ValueError(
+                    f"local VGGT intrinsics for submap {self.get_id()} frame {index} "
+                    "are singular"
+                )
+
+            # Retain the old raw-pose evidence only when its direct SO(3)
+            # interpretation fails; orientation recovery below uses the camera
+            # decomposition, not this diagnostic.
+            try:
+                raw_diagnostics = _describe_local_pose_linear_part(world_to_cam)
+                raw_rotation = np.linalg.inv(world_to_cam)[:3, :3]
+                if not _is_proper_rotation(raw_rotation):
+                    singular_values = ", ".join(
+                        f"{value:.8g}" for value in raw_diagnostics["singular_values"]
+                    )
+                    print(
+                        f"[LocalOrientationDebug] submap={self.get_id()} frame_index={index} "
+                        f"det={raw_diagnostics['determinant']:.8g} "
+                        f"singular_values=({singular_values}) "
+                        f"max_orthogonality_error="
+                        f"{raw_diagnostics['max_orthogonality_error']:.8g}"
+                    )
+            except np.linalg.LinAlgError:
+                # Decomposition below will provide the contextual failure.
+                pass
+            projections.append(intrinsics_4x4 @ world_to_cam)
+        return np.asarray(projections, dtype=float).reshape(-1, 4, 4)
+
     def get_all_poses_world(self, graph, give_camera_mat=False):
         homography_list = [graph.get_homography(i + self.get_id()) for i in range(len(self.poses))]
         poses = []
@@ -163,6 +314,83 @@ class Submap:
     
     def get_frame_pointcloud(self, pose_index):
         return self.pointclouds[pose_index]
+
+    def get_local_world_to_camera_at_index(self, index) -> np.ndarray:
+        """Return the exact retained local VGGT world-to-camera transform."""
+        if self.poses is None:
+            raise ValueError(f"local VGGT poses are not available for submap {self.get_id()}")
+        if not 0 <= index < len(self.poses):
+            raise IndexError(f"frame index {index} is out of bounds for submap {self.get_id()}")
+        pose = np.asarray(self.poses[index], dtype=float)
+        if pose.shape != (4, 4) or not np.isfinite(pose).all():
+            raise ValueError(f"local VGGT pose for submap {self.get_id()} frame {index} must be finite (4, 4)")
+        try:
+            if abs(np.linalg.det(pose)) <= 1e-12:
+                raise ValueError(f"local VGGT pose for submap {self.get_id()} frame {index} is singular")
+        except np.linalg.LinAlgError as error:
+            raise ValueError(f"local VGGT pose for submap {self.get_id()} frame {index} is not invertible") from error
+        return pose.copy()
+
+    def get_frame_points_camera(self, index) -> np.ndarray:
+        """Return dense ``(H, W, 3)`` local geometry in VGGT camera coordinates."""
+        if self.pointclouds is None or not 0 <= index < len(self.pointclouds):
+            raise IndexError(f"frame index {index} is out of bounds for submap {self.get_id()} point clouds")
+        points = np.asarray(self.pointclouds[index], dtype=float)
+        if points.ndim != 3 or points.shape[-1:] != (3,):
+            raise ValueError(f"local point frame for submap {self.get_id()} frame {index} must have shape (H, W, 3)")
+        return transform_points_homogeneous(
+            points, self.get_local_world_to_camera_at_index(index),
+            context=f"submap {self.get_id()} frame {index} local-world-to-camera",
+        )
+
+    def get_frame_points_colors_camera(self, index):
+        """Return confidence-filtered camera-space points and matching unmodified RGB."""
+        points = self.get_frame_points_camera(index)
+        if self.colors is None or self.conf_masks is None or self.conf_threshold is None:
+            raise ValueError(f"colors or confidence data are unavailable for submap {self.get_id()}")
+        if index >= len(self.colors) or index >= len(self.conf_masks):
+            raise IndexError(f"frame index {index} lacks color or confidence data for submap {self.get_id()}")
+        colors = np.asarray(self.colors[index])
+        mask = np.asarray(self.conf_masks[index]) > self.conf_threshold
+        if colors.shape != points.shape or mask.shape != points.shape[:2]:
+            raise ValueError(f"point/color/confidence shapes differ for submap {self.get_id()} frame {index}")
+        filtered_points, filtered_colors = points[mask], colors[mask]
+        if len(filtered_points) != len(filtered_colors) or not np.isfinite(filtered_points).all() or not np.isfinite(filtered_colors).all():
+            raise ValueError(f"filtered camera geometry contains invalid values for submap {self.get_id()} frame {index}")
+        return filtered_points.reshape(-1, 3), filtered_colors.reshape(-1, 3)
+
+    def get_camera_space_roundtrip_diagnostics(self, tolerance=1e-5):
+        """Validate each retained dense frame through local-world -> camera -> local-world."""
+        if tolerance <= 0 or not np.isfinite(tolerance):
+            raise ValueError("round-trip tolerance must be finite and positive")
+        if self.pointclouds is None:
+            raise ValueError(f"local point clouds are not available for submap {self.get_id()}")
+        diagnostics = []
+        for index in range(len(self.pointclouds)):
+            original = np.asarray(self.get_frame_pointcloud(index), dtype=float)
+            camera = self.get_frame_points_camera(index)
+            try:
+                reconstructed = transform_points_homogeneous(
+                    camera, np.linalg.inv(self.get_local_world_to_camera_at_index(index)),
+                    context=f"submap {self.get_id()} frame {index} camera-to-local-world",
+                )
+            except np.linalg.LinAlgError as error:
+                raise ValueError(f"submap {self.get_id()} frame {index} pose is not invertible") from error
+            delta = reconstructed - original
+            euclidean = np.linalg.norm(delta.reshape(-1, 3), axis=1)
+            item = {
+                "submap_id": self.get_id(), "frame_index": index, "num_points": len(euclidean),
+                "rmse_vggt_units": float(np.sqrt(np.mean(delta ** 2))),
+                "median_error_vggt_units": float(np.median(euclidean)),
+                "max_error_vggt_units": float(np.max(euclidean)),
+            }
+            if item["max_error_vggt_units"] > tolerance:
+                raise ValueError(
+                    f"camera-space round trip failed for submap {self.get_id()} frame {index}: "
+                    f"max_error={item['max_error_vggt_units']:.8g} > {tolerance:.8g}"
+                )
+            diagnostics.append(item)
+        return diagnostics
 
     def set_frame_ids(self, file_paths):
         """
@@ -279,6 +507,32 @@ class Submap:
                 points_all = np.vstack([points_all, points_transformed])
 
         return points_all
+
+    def get_points_local(self):
+        """Return confidence-filtered dense XYZ in VGGT's local submap frame.
+
+        ``pointclouds`` comes directly from unprojecting the prediction with
+        the local VGGT extrinsics, while ``poses`` stores those same local
+        world-to-camera transforms.  Thus these points share the coordinate
+        frame of :meth:`get_local_camera_centers` and deliberately have no
+        graph homography applied.
+        """
+        if self.pointclouds is None or self.conf_masks is None or self.conf_threshold is None:
+            raise ValueError("local submap dense points or confidence masks are not available")
+        if len(self.pointclouds) != len(self.conf_masks):
+            raise ValueError("local submap point and confidence-frame counts differ")
+        points_by_frame = []
+        for index, points in enumerate(self.pointclouds):
+            points = np.asarray(points)
+            if points.shape[-1:] != (3,):
+                raise ValueError(f"local submap point frame {index} must have three channels")
+            mask = np.asarray(self.conf_masks[index]) > self.conf_threshold
+            if mask.shape != points.shape[:-1]:
+                raise ValueError(f"local submap confidence mask {index} does not match point frame")
+            points_by_frame.append(points[mask].reshape(-1, 3))
+        if not points_by_frame:
+            return np.empty((0, 3), dtype=float)
+        return np.concatenate(points_by_frame, axis=0)
 
     def get_voxel_points_in_world_frame(self, voxel_size, nb_points=8, factor_for_outlier_rejection=2.0):
         if self.voxelized_points is None:

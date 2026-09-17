@@ -74,21 +74,62 @@ chmod +x setup.sh
 
 ## Run using images from GO2
 
-Run the go_vggt_bridge:
+VGGT-SLAM connects directly to the Go2 Jetson `go2_camera_bridge` over a
+standard TCP socket, speaking its `G2CO` protocol version 2 (a 100-byte
+header followed by one JPEG frame). The same `Go2Camera` backend and
+protocol client work unchanged for both live operation and recorded replay
+— VGGT-SLAM never parses `.g2rec` files; replay is served over the same
+TCP wire format by `camera_odom_replay.py`. The default port is `5432`.
+Go2 images are already fisheye-rectified by the Jetson bridge, and the
+transmitted metric pose is synchronized Go2 odometry metadata used only for
+diagnostics/alignment — it does not replace VGGT's own visual pose
+estimation.
+
+### Live operation
+
+On the Jetson:
 
 ```bash
-source ~/unitree_ros2/src/scripts/setup_local.sh
-ros2 launch go2_vggt_bridge go2_vggt_bridge.launch.py
+ros2 launch go2_camera_bridge camera_bridge.launch.py
 ```
 
-Run main_realtime:
+On the machine running VGGT-SLAM:
 
 ```bash
 python main_realtime.py \
      --camera go2 \
-     --max_loops 1 \
+     --go2_host 192.168.123.24 \
      --vis_map
 ```
+
+A temporary live connection loss triggers the existing automatic camera
+reconnect behavior.
+
+### Recorded (replay) operation
+
+Terminal 1, from the `go2_camera_bridge` package:
+
+```bash
+python3 /path/to/go2_camera_bridge/scripts/camera_odom_replay.py \
+  ~/go2_recordings/office_trajectory.g2rec
+```
+
+Terminal 2:
+
+```bash
+conda activate vggt-slam
+
+python main_realtime.py \
+     --camera go2 \
+     --go2_host 127.0.0.1 \
+     --go2_exit_on_disconnect \
+     --vis_map
+```
+
+`--go2_exit_on_disconnect` makes VGGT-SLAM exit its capture loop cleanly
+(running normal shutdown/final-output logic) when the one-shot replay
+server closes the connection at end of recording, instead of trying to
+reconnect forever as it does for live operation.
 
 ## Quick Start
 

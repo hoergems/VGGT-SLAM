@@ -100,6 +100,11 @@ class Solver:
         self.set_submap_point_cloud(submap)
         self.set_submap_poses(submap)
 
+    def get_global_point_cloud(self):
+        """Return the current optimized colored map (see GraphMap.get_global_point_cloud)."""
+        point_cloud, _ = self.map.get_global_point_cloud(self.graph)
+        return point_cloud
+
     def tranform_submap_to_canonical(self, proj_mat_world_to_cam, world_points):
         P_first_cam = proj_mat_world_to_cam[0].copy()
 

@@ -6,6 +6,28 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
+from vggt_slam.open3d_focus import Open3DFocusController
+
+_AXIS_MARKERS_PER_AXIS = 50
+
+
+def _with_axis_markers(point_cloud: "o3d.geometry.PointCloud", size: float = 1.0) -> "o3d.geometry.PointCloud":
+    points = np.asarray(point_cloud.points)
+    colors = np.asarray(point_cloud.colors) if point_cloud.has_colors() else np.ones_like(points)
+
+    t = np.linspace(0.0, size, _AXIS_MARKERS_PER_AXIS)
+    axis_directions = np.eye(3)
+    axis_colors = np.eye(3)
+    axis_points = np.concatenate([np.outer(t, direction) for direction in axis_directions], axis=0)
+    axis_point_colors = np.concatenate(
+        [np.tile(color, (_AXIS_MARKERS_PER_AXIS, 1)) for color in axis_colors], axis=0
+    )
+
+    combined = o3d.geometry.PointCloud()
+    combined.points = o3d.utility.Vector3dVector(np.concatenate([points, axis_points], axis=0))
+    combined.colors = o3d.utility.Vector3dVector(np.concatenate([colors, axis_point_colors], axis=0))
+    return combined
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Inspect a saved point cloud with Open3D")
@@ -41,12 +63,17 @@ def main():
     print(f"[PointCloudViewer] min_xyz={tuple(np.min(points, axis=0))}")
     print(f"[PointCloudViewer] max_xyz={tuple(np.max(points, axis=0))}")
 
-    visualizer = o3d.visualization.Visualizer()
+    display_cloud = _with_axis_markers(point_cloud) if args.show_axes else point_cloud
+
+    visualizer = o3d.visualization.VisualizerWithKeyCallback()
     visualizer.create_window(window_name=f"Point Cloud - {args.point_cloud.name}")
-    visualizer.add_geometry(point_cloud)
+    visualizer.add_geometry(display_cloud)
     visualizer.get_render_option().point_size = args.point_size
-    if args.show_axes:
-        visualizer.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame())
+
+    focus_controller = Open3DFocusController()
+    focus_controller.register(visualizer)
+    print("[PointCloudViewer] Press F to focus/recenter on the visible surface at the view center.")
+
     visualizer.run()
     visualizer.destroy_window()
 

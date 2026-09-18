@@ -1,7 +1,12 @@
-import argparse
-import torch
 import numpy as np
 import cv2
+
+
+def compute_image_sharpness(image):
+    """Return variance-of-Laplacian sharpness for a BGR image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
 
 class FrameTracker:
     def __init__(self):
@@ -20,9 +25,18 @@ class FrameTracker:
             blockSize=7
         )
 
-    def compute_disparity(self, image, min_disparity, visualize=False):
+    def accept_keyframe(self, image):
+        """Commit an accepted image as the optical-flow reference keyframe."""
+        self.initialize_keyframe(image)
+
+    def compute_disparity_candidate(self, image, min_disparity, visualize=False):
+        """Return whether ``image`` qualifies by disparity without changing state.
+
+        Call :meth:`accept_keyframe` only after any additional keyframe gates
+        have accepted this candidate. This keeps the reference state tied to
+        the last accepted keyframe rather than the last proposed one.
+        """
         if self.last_kf is None or self.kf_pts is None or len(self.kf_pts) < 10:
-            self.initialize_keyframe(image)
             return True
 
         curr_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -39,7 +53,6 @@ class FrameTracker:
         good_next = next_pts[status == 1]
 
         if len(good_kf) < 10:
-            self.initialize_keyframe(image)
             return True
 
         # Measure displacement from keyframe to current frame
@@ -56,7 +69,14 @@ class FrameTracker:
             cv2.waitKey(1)
 
         if mean_disparity > min_disparity:
-            self.initialize_keyframe(image)
             return True
-        else:
-            return False
+        return False
+
+    def compute_disparity(self, image, min_disparity, visualize=False):
+        """Legacy disparity-only selection API that commits qualifying frames."""
+        is_candidate = self.compute_disparity_candidate(
+            image, min_disparity, visualize
+        )
+        if is_candidate:
+            self.accept_keyframe(image)
+        return is_candidate

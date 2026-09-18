@@ -206,6 +206,50 @@ To visualize the maps as they being constructed, inside the bash scripts add `--
 To run online, plug in a RealSense camera and run `python main_realtime.py --vis_map`. Support for open-set object detection can be enabled with `--run_os` and objects can be queried in Viser. Note that it may be desirable to reduce submap size when running the realtime code 
 just to have more frequent map updates. For example, by adding `--submap_size 8`. 
 
+### Live Map Visualization
+
+`main_realtime.py` supports two independent, optional visualizers, which can be enabled separately or together:
+
+```bash
+# Viser (browser-based, richer: frustums, images, object-query GUI)
+python main_realtime.py --vis_map
+
+# Native Open3D window (lightweight, live colored point cloud only)
+python main_realtime.py --vis_map_open3d
+
+# Both at once
+python main_realtime.py --vis_map --vis_map_open3d
+```
+
+`--vis_map_open3d` opens a native desktop Open3D window showing the current optimized colored global map, similar to `scripts/view_point_cloud.py` but updated live as the map is built. Notes:
+
+* The Open3D map refreshes after each completed submap/graph update, not on every camera frame.
+* The displayed map is the current *optimized* global map, so previously shown submaps move when loop closure runs.
+* `--vis_voxel_size` downsamples both the Viser and Open3D visualizations only; it does not affect the internally stored map or `--map_output_path`.
+* `--vis_open3d_point_size` controls the Open3D render point size (default `2.0`).
+* Closing the Open3D window does not stop SLAM; it simply disables further Open3D updates for the rest of the run.
+
+Open3D navigation (both `main_realtime.py --vis_map_open3d` and `scripts/view_point_cloud.py`):
+* left-drag: rotate
+* middle-drag: pan/translate
+* Shift + left-drag: roll about the camera/view axis
+* mouse wheel: zoom
+* F: focus/recenter on the visible surface at the center of the window
+
+To inspect a distant part of a large map, pan/rotate until that surface is near the center of the window, press `F`, then continue zooming or rotating around the new pivot.
+
+Example with a Go2 replay session and a final exported map:
+
+```bash
+python main_realtime.py \
+    --camera go2 \
+    --go2_host 127.0.0.1 \
+    --go2_port 5432 \
+    --go2_exit_on_disconnect \
+    --vis_map_open3d \
+    --map_output_path office.ply
+```
+
 ## News and Updates
 * May 2025: VGGT-SLAM 1.0 is released
 * August 2025: SL(4) optimization is integrated into the official GTSAM repo

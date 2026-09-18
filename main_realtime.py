@@ -38,7 +38,7 @@ parser.add_argument("--vis_open3d_point_size", type=float, default=2.0, help="Op
 parser.add_argument("--vis_flow", action="store_true", help="Visualize optical flow from RAFT for keyframe selection")
 parser.add_argument("--run_os", action="store_true", help="Enable open-set semantic search with Perception Encoder CLIP and SAM3")
 parser.add_argument("--submap_size", type=int, default=16, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
-parser.add_argument("--overlapping_window_size", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW. Number of overlapping frames, which are used in SL(4) estimation")
+parser.add_argument("--overlapping_window_size", type=int, default=1, help="Number of overlapping frames retained between fixed-policy submaps")
 parser.add_argument("--submap_policy", choices=("fixed", "metric_motion"), default="fixed", help="Submap window policy. 'fixed' preserves the existing submap_size + overlap behavior. 'metric_motion' closes a Go2 submap when cumulative metric translation, cumulative rotation, or the maximum keyframe count is reached.")
 parser.add_argument("--metric_motion_max_translation_m", type=float, default=1.5, help="Metric-motion policy cumulative camera-path limit in metres")
 parser.add_argument("--metric_motion_max_rotation_deg", type=float, default=90.0, help="Metric-motion policy cumulative camera-rotation limit in degrees")
@@ -133,6 +133,22 @@ def restart_camera(camera, stop_event=None, retry_delay: float = 2.0):
     return None
 
 
+def retain_fixed_window_overlap(records, overlap_size):
+    """Return the records retained after a completed fixed-policy submap."""
+    if overlap_size < 0:
+        raise ValueError("overlap_size must be non-negative")
+    return list(records[-overlap_size:]) if overlap_size > 0 else []
+
+
+def should_flush_final_fixed_window(num_records, completed_submaps, overlap_size):
+    """Whether an EOF fixed-policy buffer contains unprocessed keyframes."""
+    if num_records < 0 or completed_submaps < 0 or overlap_size < 0:
+        raise ValueError("record count, submap count, and overlap size must be non-negative")
+    if completed_submaps == 0:
+        return num_records > 0
+    return num_records > overlap_size
+
+
 def threaded_process_submap(keyframe_records, solver, model, args, clip_model, clip_preprocess, window_metadata=None):
     """Background thread: run VGGT inference + graph optimisation for one submap."""
     try:
@@ -211,8 +227,8 @@ def run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor)
 def main():
     args = parser.parse_args()
 
-    if args.overlapping_window_size != 1:
-        parser.error("only --overlapping_window_size 1 is currently supported")
+    if args.overlapping_window_size < 0:
+        parser.error("--overlapping_window_size must be non-negative")
     if args.vis_open3d_point_size <= 0:
         parser.error("--vis_open3d_point_size must be greater than zero")
     if args.vis_voxel_size is not None and args.vis_voxel_size <= 0:
@@ -339,28 +355,34 @@ def main():
     last_status_frame = 0  # for console status throttle when display is off
     stop_event = threading.Event()
 
+    pending_frame = first_frame
+
     try:
         while True:
             if stop_event.is_set():
                 break
 
-            try:
-                frame = camera.capture()
-            except Go2ConnectionError as e:
-                if args.go2_exit_on_disconnect:
-                    print(f"[Go2] Disconnected ({e}). Exiting capture loop (--go2_exit_on_disconnect).")
-                    break
-                print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
-                camera = restart_camera(camera, stop_event)
-                if camera is None:  # session cancelled while reconnecting
-                    break
-                continue
-            except Exception as e:
-                print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
-                camera = restart_camera(camera, stop_event)
-                if camera is None:  # session cancelled while reconnecting
-                    break
-                continue
+            if pending_frame is not None:
+                frame = pending_frame
+                pending_frame = None
+            else:
+                try:
+                    frame = camera.capture()
+                except Go2ConnectionError as e:
+                    if args.go2_exit_on_disconnect:
+                        print(f"[Go2] Disconnected ({e}). Exiting capture loop (--go2_exit_on_disconnect).")
+                        break
+                    print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
+                    camera = restart_camera(camera, stop_event)
+                    if camera is None:  # session cancelled while reconnecting
+                        break
+                    continue
+                except Exception as e:
+                    print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
+                    camera = restart_camera(camera, stop_event)
+                    if camera is None:  # session cancelled while reconnecting
+                        break
+                    continue
 
             if frame is None:
                 continue
@@ -407,7 +429,9 @@ def main():
                         t = threading.Thread(target=threaded_process_submap,
                             args=(list(keyframe_records), solver, model, args, clip_model, clip_preprocess, metadata), daemon=True)
                         t.start()
-                        keyframe_records = keyframe_records[-args.overlapping_window_size:]
+                        keyframe_records = retain_fixed_window_overlap(
+                            keyframe_records, args.overlapping_window_size
+                        )
                     else:
                         # SLAM still busy; cap the backlog so we don't grow unbounded.
                         if len(keyframe_records) > target_size * 2:
@@ -492,6 +516,25 @@ def main():
     # Wait for any in-flight submap to finish before final visualization/logging.
     with solver_lock:
         pass
+
+    # The fixed-policy buffer now cannot race an ordinary background launch.
+    # Reconstruct a short stream in full, or a tail containing new records in
+    # addition to the overlap retained by a previous ordinary submap.
+    if args.submap_policy == "fixed" and should_flush_final_fixed_window(
+        len(keyframe_records), submap_count, args.overlapping_window_size
+    ):
+        final_records = list(keyframe_records)
+        submap_count += 1
+        print(f"[Main] Flushing final partial submap ({len(final_records)} frames)...")
+        metadata = SubmapWindowMetadata(
+            "fixed", "end_of_stream", None, None, len(final_records)
+        )
+        # Capture has ended, so running the existing path synchronously makes
+        # completion before final outputs explicit and deterministic.
+        solver_lock.acquire()
+        threaded_process_submap(
+            final_records, solver, model, args, clip_model, clip_preprocess, metadata
+        )
 
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())

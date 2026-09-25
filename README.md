@@ -77,13 +77,15 @@ chmod +x setup.sh
 VGGT-SLAM connects directly to the Go2 Jetson `go2_camera_bridge` over a
 standard TCP socket, speaking its `G2CO` protocol version 2 (a 100-byte
 header followed by one JPEG frame). The same `Go2Camera` backend and
-protocol client work unchanged for both live operation and recorded replay
+protocol-v3 client work unchanged for both live operation and recorded replay
 — VGGT-SLAM never parses `.g2rec` files; replay is served over the same
 TCP wire format by `camera_odom_replay.py`. The default port is `5432`.
 Go2 images are already fisheye-rectified by the Jetson bridge, and the
 transmitted metric pose is synchronized Go2 odometry metadata used only for
 diagnostics/alignment — it does not replace VGGT's own visual pose
-estimation.
+estimation. Protocol v3 also transports the raw IMU samples associated with
+each source camera interval. They are retained on realtime frames and selected
+keyframes as passive metadata; they are not yet used for SLAM or sensor fusion.
 
 ### Live operation
 
@@ -289,4 +291,3 @@ If our code is helpful, please cite our papers as follows:
   year={2026}
 }
 ```
-

@@ -26,8 +26,8 @@ map_updated_event = threading.Event()  # Signals the main thread that a new glob
 parser = argparse.ArgumentParser(description="VGGT-SLAM RealSense live demo")
 parser.add_argument("--keyframe_folder", type=str, default="keyframes", help="Folder to save captured keyframes")
 parser.add_argument("--camera", type=str, default="realsense", choices=list(BACKENDS.keys()), help="Camera backend (default: realsense)")
-parser.add_argument("--go2_host", type=str, default="192.168.123.24", help="Go2 protocol-v2 TCP host: the Jetson bridge IP for live operation, or 127.0.0.1 for camera_odom_replay.py")
-parser.add_argument("--go2_port", type=int, default=5432, help="Go2 protocol-v2 TCP port")
+parser.add_argument("--go2_host", type=str, default="192.168.123.24", help="Go2 protocol-v3 TCP host: the Jetson bridge IP for live operation, or 127.0.0.1 for camera_odom_replay.py")
+parser.add_argument("--go2_port", type=int, default=5432, help="Go2 protocol-v3 TCP port")
 parser.add_argument("--go2_receive_timeout_s", type=float, default=1.0, help="Go2 TCP receive timeout in seconds")
 parser.add_argument("--go2_exit_on_disconnect", action="store_true", help="Exit the capture loop cleanly on Go2 TCP disconnect instead of reconnecting (for one-shot camera_odom_replay.py sessions)")
 parser.add_argument("--vis_map", action="store_true", help="Visualize point cloud in viser as it is being built, otherwise only show the final map")
@@ -87,6 +87,7 @@ def save_keyframe(frame: CameraFrame, folder: str, frame_count: int) -> Keyframe
         timestamp_ns=frame.timestamp_ns,
         metric_pose=frame.metric_pose,
         sequence_id=frame.sequence_id,
+        imu_samples=frame.imu_samples,
     )
     if record.timestamp_ns is not None:
         if record.metric_pose is None:

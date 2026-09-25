@@ -11,12 +11,13 @@ import numpy as np
 
 from vggt_slam.go2_protocol import (
     HEADER_STRUCT,
+    IMU_STRUCT,
     Go2Packet,
     ProtocolError,
     decode_header,
     decode_packet,
 )
-from vggt_slam.frame_metadata import MetricCameraPose
+from vggt_slam.frame_metadata import ImuSample, MetricCameraPose
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class CameraFrame:
     sequence_id: int | None = None
     odom_before_timestamp_ns: int | None = None
     odom_after_timestamp_ns: int | None = None
+    imu_samples: tuple[ImuSample, ...] = ()
 
 
 class Camera(ABC):
@@ -81,7 +83,7 @@ class RealSenseCamera(Camera):
 
 
 def _packet_to_camera_frame(packet: Go2Packet) -> CameraFrame | None:
-    """Decode a protocol-v2 packet's JPEG into a camera frame."""
+    """Decode a protocol-v3 packet's JPEG into a camera frame."""
     image = cv2.imdecode(
         np.frombuffer(packet.jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
     )
@@ -103,11 +105,12 @@ def _packet_to_camera_frame(packet: Go2Packet) -> CameraFrame | None:
         sequence_id=packet.sequence_id,
         odom_before_timestamp_ns=packet.odom_before_timestamp_ns,
         odom_after_timestamp_ns=packet.odom_after_timestamp_ns,
+        imu_samples=packet.imu_samples,
     )
 
 
 def _decode_packet_to_camera_frame(packet_bytes: bytes) -> CameraFrame | None:
-    """Decode one complete Go2 protocol-v2 packet into a camera frame."""
+    """Decode one complete Go2 protocol-v3 packet into a camera frame."""
     return _packet_to_camera_frame(decode_packet(packet_bytes))
 
 
@@ -116,11 +119,11 @@ class Go2ConnectionError(ConnectionError):
 
 
 class Go2Camera(Camera):
-    """Camera backend reading a direct TCP protocol-v2 stream from Go2CameraBridge.
+    """Camera backend reading a direct TCP protocol-v3 stream from Go2CameraBridge.
 
     Works identically against a live Jetson bridge (``192.168.123.24:5432``)
     and a ``camera_odom_replay.py`` server (``127.0.0.1:5432``) since both
-    speak the same ``G2CO`` protocol-v2 wire format over plain TCP.
+    speak the same ``G2CO`` protocol-v3 wire format over plain TCP.
     """
 
     def __init__(
@@ -141,6 +144,12 @@ class Go2Camera(Camera):
         self._socket: socket_module.socket | None = None
         self.previous_sequence_id: int | None = None
         self.previous_timestamp_ns: int | None = None
+
+    # Corrupt headers must not turn into unbounded socket reads. These limits
+    # remain far above normal Go2 operation (about 15 IMU samples/frame).
+    MAX_IMU_SAMPLES = 1_000_000
+    MAX_JPEG_BYTES = 64 * 1024 * 1024
+    MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
 
     def start(self) -> None:
         if self._socket is not None:
@@ -235,25 +244,24 @@ class Go2Camera(Camera):
             header = decode_header(header_bytes)
         except ProtocolError as error:
             raise Go2ConnectionError(
-                f"invalid protocol-v2 header: {error}"
+                f"invalid Go2 protocol header: {error}"
             ) from error
 
-        jpeg_bytes = self._read_exact(header.jpeg_length)
-        if len(jpeg_bytes) != header.jpeg_length:
+        imu_bytes_length = header.imu_sample_count * IMU_STRUCT.size
+        total_payload_bytes = imu_bytes_length + header.jpeg_length
+        if (header.imu_sample_count > self.MAX_IMU_SAMPLES
+                or header.jpeg_length > self.MAX_JPEG_BYTES
+                or total_payload_bytes > self.MAX_PAYLOAD_BYTES):
             raise Go2ConnectionError(
-                f"connection closed (EOF) while reading JPEG payload "
-                f"({len(jpeg_bytes)}/{header.jpeg_length} bytes)"
+                "declared Go2 protocol payload exceeds safety limits: "
+                f"imu_samples={header.imu_sample_count}, jpeg_bytes={header.jpeg_length}"
             )
-
-        packet = Go2Packet(
-            sequence_id=header.sequence_id,
-            camera_timestamp_ns=header.camera_timestamp_ns,
-            position_xyz=header.position_xyz,
-            quaternion_xyzw=header.quaternion_xyzw,
-            odom_before_timestamp_ns=header.odom_before_timestamp_ns,
-            odom_after_timestamp_ns=header.odom_after_timestamp_ns,
-            jpeg_bytes=jpeg_bytes,
-        )
+        imu_bytes = self._read_exact(imu_bytes_length)
+        jpeg_bytes = self._read_exact(header.jpeg_length)
+        try:
+            packet = decode_packet(header_bytes + imu_bytes + jpeg_bytes)
+        except ProtocolError as error:
+            raise Go2ConnectionError(f"invalid Go2 protocol packet: {error}") from error
 
         self._validate_progression(packet.sequence_id, packet.camera_timestamp_ns)
         return _packet_to_camera_frame(packet)

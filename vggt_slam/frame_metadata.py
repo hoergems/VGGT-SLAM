@@ -12,6 +12,16 @@ class MetricCameraPose:
 
 
 @dataclass(frozen=True)
+class ImuSample:
+    """One raw IMU measurement as transported by the Go2 bridge."""
+
+    timestamp_ns: int
+    orientation_xyzw: tuple[float, float, float, float]
+    angular_velocity_xyz: tuple[float, float, float]
+    linear_acceleration_xyz: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
 class MetricTrajectorySample:
     """One canonical Go2 metric camera sample in the ``odom`` frame.
 
@@ -55,3 +65,6 @@ class KeyframeRecord:
     timestamp_ns: int | None = None
     metric_pose: MetricCameraPose | None = None
     sequence_id: int | None = None
+    # This is the source-camera interval, not necessarily the interval since
+    # the prior selected VGGT keyframe; rejected frames are not aggregated.
+    imu_samples: tuple[ImuSample, ...] = ()

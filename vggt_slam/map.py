@@ -3,7 +3,13 @@ import torch
 import open3d as o3d
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
-from vggt_slam.frame_metadata import MetricTrajectorySample, VGGTTrajectorySample
+from vggt_slam.frame_metadata import (
+    MetricTrajectorySample,
+    VGGTScaleDiagnosticSample,
+    VGGTSubmapTrajectorySample,
+    VGGTTrajectorySample,
+)
+from vggt_slam.ply_map import PLYCameraPose, write_map_ply
 from vggt_slam.slam_utils import decompose_camera, cosine_similarity
 
 
@@ -358,6 +364,98 @@ class GraphMap:
         print("[VGGTTrajectory] timestamps_match_metric=yes")
         return samples
 
+    def get_vggt_submap_camera_trajectory(self, graph) -> list[VGGTSubmapTrajectorySample]:
+        """Return all timestamped VGGT camera occurrences in ordinary submaps.
+
+        Unlike :meth:`get_vggt_camera_trajectory`, this diagnostic export does
+        not deduplicate overlap timestamps.  Each occurrence retains the final
+        pose optimized for its own submap.
+        """
+        samples = []
+
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+            records = submap.get_keyframe_records() or []
+            if not any(record.timestamp_ns is not None for record in records):
+                continue
+
+            projection_mats = submap.get_all_poses_world(graph, give_camera_mat=True)
+            frame_ids = submap.get_frame_ids()
+            if len(projection_mats) != len(frame_ids) or len(records) != len(frame_ids):
+                raise ValueError(
+                    "VGGT submap trajectory submap length mismatch: "
+                    f"projections={len(projection_mats)}, frame_ids={len(frame_ids)}, records={len(records)}"
+                )
+
+            for frame_index, (record, projection_mat) in enumerate(zip(records, projection_mats)):
+                if record.timestamp_ns is None:
+                    continue
+                # Metric metadata is the authoritative counterpart for every
+                # exported Go2 timestamp; validate it without reconstructing it.
+                self._metric_trajectory_sample_from_record(record)
+                position_xyz, quaternion_xyzw = camera_pose_from_projection(projection_mat)
+                samples.append(
+                    VGGTSubmapTrajectorySample(
+                        timestamp_ns=record.timestamp_ns,
+                        frame_id=record.frame_id,
+                        position_xyz=position_xyz,
+                        quaternion_xyzw=quaternion_xyzw,
+                        submap_id=submap.get_id(),
+                        frame_index=frame_index,
+                    )
+                )
+
+        return samples
+
+    def get_vggt_scale_diagnostic_samples(self, graph) -> list[VGGTScaleDiagnosticSample]:
+        """Return raw local, final VGGT, and metric positions per occurrence.
+
+        This deliberately preserves overlap occurrences and excludes loop
+        closure submaps.  It only exposes already-existing SLAM data; no
+        scale fitting or graph mutation happens in this runtime path.
+        """
+        samples = []
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+            records = submap.get_keyframe_records() or []
+            if not any(record.timestamp_ns is not None for record in records):
+                continue
+            frame_ids = submap.get_frame_ids()
+            raw_centers = submap.get_local_camera_centers()
+            projection_mats = submap.get_all_poses_world(graph, give_camera_mat=True)
+            if not (len(records) == len(frame_ids) == len(raw_centers) == len(projection_mats)):
+                raise ValueError(
+                    "VGGT scale diagnostic submap length mismatch: "
+                    f"records={len(records)}, frame_ids={len(frame_ids)}, "
+                    f"raw_centers={len(raw_centers)}, projections={len(projection_mats)}"
+                )
+            incoming_scale_factor = submap.get_incoming_scale_factor()
+            for frame_index, (record, raw_center, projection_mat) in enumerate(
+                zip(records, raw_centers, projection_mats)
+            ):
+                if record.timestamp_ns is None:
+                    continue
+                metric_sample = self._metric_trajectory_sample_from_record(record)
+                optimized_position, _ = camera_pose_from_projection(projection_mat)
+                raw_position = tuple(float(value) for value in raw_center)
+                if not np.isfinite(raw_position).all():
+                    raise ValueError(
+                        f"raw VGGT camera center contains non-finite values for submap {submap.get_id()} frame {frame_index}"
+                    )
+                samples.append(VGGTScaleDiagnosticSample(
+                    timestamp_ns=record.timestamp_ns,
+                    submap_id=submap.get_id(),
+                    frame_index=frame_index,
+                    frame_id=record.frame_id,
+                    raw_vggt_position_xyz=raw_position,
+                    optimized_vggt_position_xyz=optimized_position,
+                    metric_position_xyz=metric_sample.position_xyz,
+                    incoming_scale_factor=incoming_scale_factor,
+                ))
+        return samples
+
     @staticmethod
     def plot_vggt_camera_trajectory(samples, output_path) -> None:
         """Plot the unaligned optimized VGGT XY camera path for inspection."""
@@ -398,6 +496,35 @@ class GraphMap:
             poses = submap.get_all_poses_world(graph, give_camera_mat=give_camera_mat)
             cam_mats.append(poses)
         return np.vstack(cam_mats)
+
+    def get_unique_optimized_camera_poses(self, graph) -> list[PLYCameraPose]:
+        """Return one final optimized VGGT pose per ordinary source frame.
+
+        Unlike the timestamped trajectory API this deliberately relies only on
+        frame identity, so offline image sequences and realtime runs share the
+        same PLY export path.
+        """
+        poses = []
+        seen_frame_ids = set()
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+            projection_mats = submap.get_all_poses_world(graph, give_camera_mat=True)
+            frame_ids = submap.get_frame_ids()
+            if len(projection_mats) != len(frame_ids):
+                raise ValueError(
+                    "PLY camera submap length mismatch: "
+                    f"projections={len(projection_mats)}, frame_ids={len(frame_ids)}"
+                )
+            for frame_id, projection_mat in zip(frame_ids, projection_mats):
+                if frame_id in seen_frame_ids:
+                    continue
+                if isinstance(frame_id, bool) or int(frame_id) != frame_id:
+                    raise ValueError(f"PLY camera frame_id must be an integer: {frame_id!r}")
+                position_xyz, quaternion_xyzw = camera_pose_from_projection(projection_mat)
+                poses.append(PLYCameraPose(int(frame_id), position_xyz, quaternion_xyzw))
+                seen_frame_ids.add(frame_id)
+        return poses
 
     def write_poses_to_file(self, file_name, graph, give_camera_mat=False, kitti_format=False):
         all_poses = self.get_all_cam_matricies(give_camera_mat=True, graph=graph)
@@ -445,6 +572,49 @@ class GraphMap:
                     + "\n"
                 )
         print(f"[VGGTTrajectory] wrote {file_name}")
+
+    def write_vggt_submap_trajectory_to_file(self, file_name, graph, samples=None):
+        """Write overlap-preserving VGGT poses with ordinary-submap membership."""
+        if samples is None:
+            samples = self.get_vggt_submap_camera_trajectory(graph)
+        with open(file_name, "w") as f:
+            for sample in samples:
+                f.write(
+                    f"{sample.timestamp_ns} {sample.submap_id} {sample.frame_index} {sample.frame_id} "
+                    + " ".join(
+                        f"{value:.8f}"
+                        for value in (*sample.position_xyz, *sample.quaternion_xyzw)
+                    )
+                    + "\n"
+                )
+
+        unique_timestamps = len({sample.timestamp_ns for sample in samples})
+        print(f"[VGGTSubmapTrajectory] ordinary_submaps={len({sample.submap_id for sample in samples})}")
+        print(f"[VGGTSubmapTrajectory] occurrences={len(samples)}")
+        print(f"[VGGTSubmapTrajectory] unique_timestamps={unique_timestamps}")
+        print(f"[VGGTSubmapTrajectory] overlap_occurrences={len(samples) - unique_timestamps}")
+        print(f"[VGGTSubmapTrajectory] wrote {file_name}")
+
+    def write_vggt_scale_diagnostics_to_file(self, file_name, graph, samples=None):
+        """Write raw/final/metric position occurrences for offline diagnostics."""
+        if samples is None:
+            samples = self.get_vggt_scale_diagnostic_samples(graph)
+        with open(file_name, "w") as f:
+            for sample in samples:
+                incoming = "nan" if sample.incoming_scale_factor is None else f"{sample.incoming_scale_factor:.8f}"
+                values = (
+                    *sample.raw_vggt_position_xyz,
+                    *sample.optimized_vggt_position_xyz,
+                    *sample.metric_position_xyz,
+                )
+                f.write(
+                    f"{sample.timestamp_ns} {sample.submap_id} {sample.frame_index} {sample.frame_id} "
+                    + " ".join(f"{value:.8f}" for value in values)
+                    + f" {incoming}\n"
+                )
+        print(f"[VGGTScaleDiagnostics] ordinary_submaps={len({sample.submap_id for sample in samples})}")
+        print(f"[VGGTScaleDiagnostics] occurrences={len(samples)}")
+        print(f"[VGGTScaleDiagnostics] wrote {file_name}")
 
     def get_global_point_cloud(self, graph):
         """Build the final colored dense map from ordinary submaps only.
@@ -506,13 +676,17 @@ class GraphMap:
     def write_points_to_file(self, graph, file_name):
         """Write the final optimized colored map to any Open3D-supported format."""
         point_cloud, ordinary_submaps = self.get_global_point_cloud(graph)
-        if not o3d.io.write_point_cloud(str(file_name), point_cloud):
+        if str(file_name).lower().endswith(".ply"):
+            camera_poses = self.get_unique_optimized_camera_poses(graph)
+            write_map_ply(file_name, point_cloud.points, point_cloud.colors, camera_poses)
+        elif not o3d.io.write_point_cloud(str(file_name), point_cloud):
             raise IOError(f"failed to write point cloud to {file_name}")
 
         points = np.asarray(point_cloud.points)
         print(f"[MapExport] ordinary_submaps={ordinary_submaps}")
         print(f"[MapExport] points={len(points)}")
+        if str(file_name).lower().endswith(".ply"):
+            print(f"[MapExport] cameras={len(camera_poses)}")
         print(f"[MapExport] min_xyz={tuple(np.min(points, axis=0))}")
         print(f"[MapExport] max_xyz={tuple(np.max(points, axis=0))}")
         print(f"[MapExport] wrote {file_name}")
-

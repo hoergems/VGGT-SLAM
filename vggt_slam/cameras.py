@@ -18,6 +18,7 @@ from vggt_slam.go2_protocol import (
     decode_packet,
 )
 from vggt_slam.frame_metadata import ImuSample, MetricCameraPose
+from vggt_slam.metric_pose_utils import go2_body_pose_to_metric_camera_pose
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ class RealSenseCamera(Camera):
 
 
 def _packet_to_camera_frame(packet: Go2Packet) -> CameraFrame | None:
-    """Decode a protocol-v3 packet's JPEG into a camera frame."""
+    """Decode a packet and derive its front-camera pose from body odometry."""
     image = cv2.imdecode(
         np.frombuffer(packet.jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
     )
@@ -98,9 +99,10 @@ def _packet_to_camera_frame(packet: Go2Packet) -> CameraFrame | None:
     return CameraFrame(
         image=image,
         timestamp_ns=packet.camera_timestamp_ns,
-        metric_pose=MetricCameraPose(
-            position_xyz=packet.position_xyz,
-            quaternion_xyzw=packet.quaternion_xyzw,
+        # Packets carry synchronized T_odom_body; CameraFrame stores the
+        # derived physical front optical-camera T_odom_camera.
+        metric_pose=go2_body_pose_to_metric_camera_pose(
+            packet.position_xyz, packet.quaternion_xyzw
         ),
         sequence_id=packet.sequence_id,
         odom_before_timestamp_ns=packet.odom_before_timestamp_ns,

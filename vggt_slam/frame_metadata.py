@@ -5,7 +5,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MetricCameraPose:
-    """Authoritative upstream metric transform ``T_odom_camera``."""
+    """Authoritative derived metric transform ``T_odom_camera``.
+
+    For Go2 data this is derived from synchronized ``T_odom_body`` packet
+    odometry plus the fixed nominal front-camera extrinsic at ingestion.
+    """
 
     position_xyz: tuple[float, float, float]
     quaternion_xyzw: tuple[float, float, float, float]
@@ -50,6 +54,44 @@ class VGGTTrajectorySample:
     quaternion_xyzw: tuple[float, float, float, float]
     submap_id: int
     frame_index: int
+
+
+@dataclass(frozen=True)
+class VGGTSubmapTrajectorySample:
+    """One optimized VGGT camera-pose occurrence in an ordinary submap.
+
+    This intentionally preserves duplicate source timestamps for overlap
+    keyframes: each ordinary submap contributes its complete local window.
+    """
+
+    timestamp_ns: int
+    frame_id: int | float
+    position_xyz: tuple[float, float, float]
+    quaternion_xyzw: tuple[float, float, float, float]
+    submap_id: int
+    frame_index: int
+
+
+@dataclass(frozen=True)
+class VGGTScaleDiagnosticSample:
+    """One ordinary-submap occurrence for raw/final/metric scale analysis.
+
+    ``raw_vggt_position_xyz`` is the local VGGT camera center before graph
+    alignment; ``optimized_vggt_position_xyz`` is the final graph-optimized
+    camera center; and ``metric_position_xyz`` is the synchronized Go2
+    optical-camera position in metric odom coordinates.  The optional
+    ``incoming_scale_factor`` is the existing current-raw to previous-raw
+    point-cloud alignment factor, not a metric scale.
+    """
+
+    timestamp_ns: int
+    submap_id: int
+    frame_index: int
+    frame_id: int | float
+    raw_vggt_position_xyz: tuple[float, float, float]
+    optimized_vggt_position_xyz: tuple[float, float, float]
+    metric_position_xyz: tuple[float, float, float]
+    incoming_scale_factor: float | None
 
 
 @dataclass(frozen=True)

@@ -61,6 +61,8 @@ parser.add_argument("--skip_dense_log", action="store_true", help="by default, l
 parser.add_argument("--log_path", type=str, default="poses.txt", help="Path to save the log file")
 parser.add_argument("--metric_trajectory_path", type=str, default=None, help="Write unique Go2 metric keyframe trajectory as: timestamp_ns x y z qx qy qz qw")
 parser.add_argument("--vggt_trajectory_path", type=str, default=None, help="Write unique timestamped optimized VGGT camera trajectory as: timestamp_ns x y z qx qy qz qw")
+parser.add_argument("--vggt_submap_trajectory_path", type=str, default=None, help="Write overlap-preserving optimized VGGT camera poses with actual ordinary-submap membership for metric-scale diagnostics")
+parser.add_argument("--vggt_scale_diagnostics_path", type=str, default=None, help="Write raw/local VGGT, final optimized VGGT, metric camera positions, and VGGT-SLAM incoming submap scale factors for offline scale diagnostics")
 parser.add_argument("--vggt_trajectory_plot_path", type=str, default=None, help="Write an XY diagnostic plot of the unaligned VGGT camera trajectory")
 parser.add_argument("--map_output_path", type=str, default=None, help="Write the final optimized colored VGGT point cloud to this file (recommended: .ply)")
 
@@ -565,6 +567,18 @@ def main():
             )
         if args.vggt_trajectory_plot_path is not None:
             solver.map.plot_vggt_camera_trajectory(vggt_trajectory, args.vggt_trajectory_plot_path)
+
+    if args.vggt_submap_trajectory_path is not None:
+        solver.map.write_vggt_submap_trajectory_to_file(
+            args.vggt_submap_trajectory_path,
+            solver.graph,
+        )
+
+    if args.vggt_scale_diagnostics_path is not None:
+        solver.map.write_vggt_scale_diagnostics_to_file(
+            args.vggt_scale_diagnostics_path,
+            solver.graph,
+        )
 
     if args.map_output_path is not None:
         solver.map.write_points_to_file(solver.graph, args.map_output_path)

@@ -73,14 +73,8 @@ parser.add_argument("--vggt_trajectory_path", type=str, default=None, help="Writ
 parser.add_argument("--vggt_submap_trajectory_path", type=str, default=None, help="Write overlap-preserving optimized VGGT camera poses with actual ordinary-submap membership for metric-scale diagnostics")
 parser.add_argument("--vggt_scale_diagnostics_path", type=str, default=None, help="Write raw/local VGGT, final optimized VGGT, metric camera positions, and VGGT-SLAM incoming submap scale factors for offline scale diagnostics")
 parser.add_argument("--metricize_submaps_from_go2", action="store_true", help="EXPERIMENTAL: scale each ordinary VGGT submap from synchronized Go2 translation only")
-parser.add_argument("--go2_odom_translation_scale", type=float, default=1.20, help="Physical translation calibration applied to Go2 odometry-derived metric geometry (default: 1.20); used by Go2 submap metricization and the experimental planning map")
+parser.add_argument("--go2_odom_translation_scale", type=float, default=1.20, help="Physical translation calibration applied to Go2 odometry-derived metric geometry (default: 1.20); used by Go2 submap metricization")
 parser.add_argument("--metric_submap_diagnostics_path", type=str, default=None, help="Write per-ordinary-submap Go2 metricization diagnostics CSV")
-parser.add_argument("--planning_map_output_path", type=str, default=None, help="EXPERIMENTAL: incrementally write an unfused raw-VGGT Sim(3)-aligned calibrated Go2 odom planning PLY")
-parser.add_argument("--planning_map_diagnostics_path", type=str, default=None, help="Optional CSV of every experimental planning-map submap acceptance/rejection")
-parser.add_argument("--planning_orientation_diagnostics_path", type=str, default=None, help="DIAGNOSTIC ONLY: write raw-VGGT to Go2 optical-camera orientation-alignment CSVs")
-parser.add_argument("--planning_sim3_min_frames", type=int, default=3, help="Minimum matched Go2/VGGT frames for an accepted planning Sim(3)")
-parser.add_argument("--planning_sim3_min_path_m", type=float, default=0.20, help="Minimum calibrated Go2 odom path length for an accepted planning Sim(3)")
-parser.add_argument("--planning_sim3_max_rmse_m", type=float, default=0.10, help="Maximum camera-center Sim(3) RMSE for an accepted planning submap")
 parser.add_argument("--vggt_trajectory_plot_path", type=str, default=None, help="Write an XY diagnostic plot of the unaligned VGGT camera trajectory")
 parser.add_argument("--map_output_path", type=str, default=None, help="Write the final optimized colored VGGT point cloud to this file (recommended: .ply)")
 parser.add_argument("--odom_aligned_map_output_path", type=str, default=None, help="EXPERIMENTAL: export the final graph-optimized metric VGGT map rigidly aligned to Go2 odom using the first synchronized optical-camera pose (.ply only)")
@@ -270,20 +264,8 @@ def main():
         parser.error("--keyframe_min_sharpness must be finite and non-negative")
     if not np.isfinite(args.go2_odom_translation_scale) or args.go2_odom_translation_scale <= 0:
         parser.error("--go2_odom_translation_scale must be finite and positive")
-    if args.planning_sim3_min_frames < 3:
-        parser.error("--planning_sim3_min_frames must be at least 3")
-    if not np.isfinite(args.planning_sim3_min_path_m) or args.planning_sim3_min_path_m < 0:
-        parser.error("--planning_sim3_min_path_m must be finite and non-negative")
-    if not np.isfinite(args.planning_sim3_max_rmse_m) or args.planning_sim3_max_rmse_m < 0:
-        parser.error("--planning_sim3_max_rmse_m must be finite and non-negative")
-    if args.planning_map_diagnostics_path and not args.planning_map_output_path:
-        parser.error("--planning_map_diagnostics_path requires --planning_map_output_path")
     if args.metricize_submaps_from_go2:
         print(f"[MetricSubmap] ENABLED: per-submap Go2 scale metricization, odom_translation_scale={args.go2_odom_translation_scale:.6f}")
-    if args.planning_map_output_path:
-        print(f"[PlanningMap] ENABLED: raw-VGGT Sim(3) to physically calibrated Go2 odom, odom_translation_scale={args.go2_odom_translation_scale:.6f}, output={args.planning_map_output_path}")
-    if args.planning_orientation_diagnostics_path:
-        print(f"[OrientationDiag] ENABLED: raw pre-metricization VGGT to Go2 optical-camera orientation comparison, output={args.planning_orientation_diagnostics_path}")
     if args.submap_policy == "metric_motion":
         if not np.isfinite(args.metric_motion_max_translation_m) or args.metric_motion_max_translation_m <= 0:
             parser.error("--metric_motion_max_translation_m must be finite and positive")
@@ -314,12 +296,6 @@ def main():
         vis_imgs=args.vis_imgs,
         metricize_submaps_from_go2=args.metricize_submaps_from_go2,
         go2_odom_translation_scale=args.go2_odom_translation_scale,
-        planning_map_output_path=args.planning_map_output_path,
-        planning_map_diagnostics_path=args.planning_map_diagnostics_path,
-        planning_orientation_diagnostics_path=args.planning_orientation_diagnostics_path,
-        planning_sim3_min_frames=args.planning_sim3_min_frames,
-        planning_sim3_min_path_m=args.planning_sim3_min_path_m,
-        planning_sim3_max_rmse_m=args.planning_sim3_max_rmse_m,
     )
 
     open3d_viewer = None

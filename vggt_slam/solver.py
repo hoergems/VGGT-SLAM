@@ -7,6 +7,7 @@ import time
 import open3d as o3d
 from termcolor import colored
 from scipy.linalg import rq
+from scipy.spatial.transform import Rotation
 
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -23,6 +24,15 @@ from vggt_slam.metric_submap_scale import (
     DEFAULT_MIN_METRIC_PATH_M,
     apply_metric_submap_scale,
     estimate_metric_submap_scale,
+    fit_similarity_transform,
+)
+from vggt_slam.planning_map import PlanningMapAccumulator
+from vggt_slam.metric_pose_utils import metric_pose_to_optical_camera_to_odom
+from vggt_slam.orientation_alignment import (
+    analyze_orientation_alignment,
+    project_matrices_to_so3,
+    relative_rotation_angle_deg,
+    summarize_angles,
 )
 from vggt_slam.viewer import Viewer
 
@@ -47,7 +57,13 @@ class Solver:
         vis_imgs: bool = False,
         metricize_submaps_from_go2: bool = False,
         go2_odom_translation_scale: float = 1.20,
-        metric_submap_min_path_m: float = DEFAULT_MIN_METRIC_PATH_M):
+        metric_submap_min_path_m: float = DEFAULT_MIN_METRIC_PATH_M,
+        planning_map_output_path: str | None = None,
+        planning_map_diagnostics_path: str | None = None,
+        planning_orientation_diagnostics_path: str | None = None,
+        planning_sim3_min_frames: int = 3,
+        planning_sim3_min_path_m: float = 0.20,
+        planning_sim3_max_rmse_m: float = 0.10):
 
         self.init_conf_threshold = init_conf_threshold
         self.vis_voxel_size = vis_voxel_size
@@ -55,6 +71,19 @@ class Solver:
         self.metricize_submaps_from_go2 = metricize_submaps_from_go2
         self.go2_odom_translation_scale = go2_odom_translation_scale
         self.metric_submap_min_path_m = metric_submap_min_path_m
+        self.planning_map = None if planning_map_output_path is None else PlanningMapAccumulator(
+            output_path=planning_map_output_path,
+            diagnostics_path=planning_map_diagnostics_path,
+            min_frames=planning_sim3_min_frames,
+            min_path_m=planning_sim3_min_path_m,
+            max_rmse_m=planning_sim3_max_rmse_m,
+            odom_translation_scale=self.go2_odom_translation_scale,
+        )
+        self.planning_orientation_diagnostics_path = planning_orientation_diagnostics_path
+        if self.planning_orientation_diagnostics_path is not None:
+            summary_path, frames_path = self._orientation_diagnostic_paths(self.planning_orientation_diagnostics_path)
+            self._ensure_csv_header(summary_path, self._orientation_summary_columns())
+            self._ensure_csv_header(frames_path, self._orientation_frame_columns())
 
         self.viewer = Viewer()
 
@@ -71,6 +100,185 @@ class Solver:
         self.vggt_timer = Accumulator()
         self.loop_closure_timer = Accumulator()
         self.clip_timer = Accumulator()
+
+    def _add_planning_submap(self, raw_centers, raw_vggt_rotations, world_points, colors, conf):
+        """Process the ordinary current submap before metricization mutates it."""
+        records = self.current_working_submap.get_keyframe_records()
+        submap_id = self.current_working_submap.get_id()
+        if records is None or len(records) != len(raw_centers) or any(record.metric_pose is None for record in records):
+            # Keep an explicit diagnostic rather than silently losing a requested map.
+            self.planning_map.reject_missing_metric_pose(
+                submap_id, len(raw_centers),
+                [] if records is None else [record.timestamp_ns for record in records],
+            )
+            return
+        raw_odom_positions = np.asarray([record.metric_pose.position_xyz for record in records], dtype=float)
+        odom_rotations = np.asarray(
+            [metric_pose_to_optical_camera_to_odom(record.metric_pose) for record in records], dtype=float,
+        )
+        confidence_threshold = np.percentile(conf, self.init_conf_threshold) + 1e-6
+        mask = np.asarray(conf) > confidence_threshold
+        raw_points = np.asarray(world_points)[mask].reshape(-1, 3)
+        raw_colors = np.asarray(colors)[mask].reshape(-1, 3)
+        timestamps = [record.timestamp_ns for record in records]
+        self.planning_map.process_submap(
+            submap_id, raw_centers, raw_vggt_rotations, raw_odom_positions, odom_rotations,
+            raw_points, raw_colors, timestamps,
+        )
+
+    @staticmethod
+    def _orientation_diagnostic_paths(summary_path):
+        from pathlib import Path
+
+        summary = Path(summary_path)
+        return summary, summary.with_name(f"{summary.stem}_frames{summary.suffix or '.csv'}")
+
+    @staticmethod
+    def _ensure_csv_header(path, fieldnames):
+        import csv
+
+        exists = path.exists()
+        if not exists:
+            with path.open("w", newline="") as output:
+                csv.DictWriter(output, fieldnames=fieldnames).writeheader()
+
+    @classmethod
+    def _append_csv_row(cls, path, fieldnames, row):
+        import csv
+
+        cls._ensure_csv_header(path, fieldnames)
+        with path.open("a", newline="") as output:
+            csv.DictWriter(output, fieldnames=fieldnames).writerow(row)
+
+    @staticmethod
+    def _orientation_summary_columns():
+        rotation_columns = [f"{prefix}_r{row}{column}" for prefix in ("position", "orientation") for row in range(3) for column in range(3)]
+        axis_columns = [f"{prefix}_vggt_z_in_odom_{axis}" for prefix in ("position", "orientation") for axis in "xyz"]
+        return [
+            "submap_id", "status", "reason", "num_frames", "first_timestamp_ns", "last_timestamp_ns", "odom_translation_scale",
+            "raw_odom_path_m", "corrected_odom_path_m", "position_sim3_scale", "position_sim3_rmse_m",
+            "position_sim3_max_error_m", "orientation_mean_residual_deg", "orientation_median_residual_deg",
+            "orientation_p95_residual_deg", "orientation_max_residual_deg", "position_rotation_mean_residual_deg",
+            "position_rotation_median_residual_deg", "position_rotation_p95_residual_deg", "position_rotation_max_residual_deg",
+            "position_vs_orientation_angle_deg", "relative_rotation_angle_deg", "mapped_up_axis_angle_deg",
+            "vggt_raw_det_mean", "vggt_raw_det_min", "vggt_raw_det_max",
+            "vggt_raw_orthogonality_error_mean", "vggt_raw_orthogonality_error_p95", "vggt_raw_orthogonality_error_max",
+            "vggt_projection_frobenius_error_mean", "vggt_projection_frobenius_error_p95", "vggt_projection_frobenius_error_max",
+            "vggt_singular_value_min_overall", "vggt_singular_value_max_overall",
+            "vggt_singular_value_spread_mean", "vggt_singular_value_spread_max",
+        ] + rotation_columns + axis_columns
+
+    @staticmethod
+    def _orientation_frame_columns():
+        return [
+            "submap_id", "frame_index", "frame_id", "timestamp_ns", "raw_vggt_det",
+            "raw_vggt_orthogonality_error", "raw_vggt_sv0", "raw_vggt_sv1", "raw_vggt_sv2",
+            "raw_vggt_projection_frobenius_error", "alignment_qx", "alignment_qy", "alignment_qz",
+            "alignment_qw", "orientation_mean_residual_deg", "position_rotation_residual_deg",
+        ]
+
+    def _write_orientation_diagnostic_skip(self, submap_id, reason, records=None):
+        summary_path, frames_path = self._orientation_diagnostic_paths(self.planning_orientation_diagnostics_path)
+        # Retain both artifacts even when no frame can be analyzed, so a
+        # diagnostic failure is inspectable rather than silently invisible.
+        self._ensure_csv_header(frames_path, self._orientation_frame_columns())
+        num_frames = 0 if records is None else len(records)
+        self._append_csv_row(summary_path, self._orientation_summary_columns(), {
+            "submap_id": submap_id, "status": "skipped", "reason": reason, "num_frames": num_frames,
+            "first_timestamp_ns": "" if not records else records[0].timestamp_ns,
+            "last_timestamp_ns": "" if not records else records[-1].timestamp_ns,
+            "odom_translation_scale": self.go2_odom_translation_scale,
+        })
+
+    def _add_orientation_alignment_diagnostic(self, raw_centers, raw_vggt_rotations):
+        """Write an observational raw-VGGT/Go2 orientation row for this submap."""
+        records = self.current_working_submap.get_keyframe_records()
+        submap_id = self.current_working_submap.get_id()
+        if records is None or len(records) != len(raw_centers) or any(record.metric_pose is None for record in records):
+            reason = "incomplete synchronized Go2 metric poses"
+            self._write_orientation_diagnostic_skip(submap_id, reason, records)
+            print(colored(f"[OrientationDiag] submap={submap_id} skipped: {reason}", "yellow"))
+            return
+        raw_odom_positions = np.asarray([record.metric_pose.position_xyz for record in records], dtype=float)
+        corrected_odom_positions = raw_odom_positions[0] + self.go2_odom_translation_scale * (raw_odom_positions - raw_odom_positions[0])
+        try:
+            position_fit = fit_similarity_transform(raw_centers, corrected_odom_positions)
+            odom_rotations = np.asarray(
+                [metric_pose_to_optical_camera_to_odom(record.metric_pose) for record in records], dtype=float
+            )
+            # Raw VGGT network pose blocks are projected and measured here only;
+            # Go2 quaternion-derived rotations remain strict SO(3) inputs.
+            projection = project_matrices_to_so3(raw_vggt_rotations)
+            orientation = analyze_orientation_alignment(projection.rotations, odom_rotations)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            reason = str(exc)
+            self._write_orientation_diagnostic_skip(submap_id, reason, records)
+            print(colored(f"[OrientationDiag] submap={submap_id} skipped: {reason}", "yellow"))
+            return
+
+        position_residuals = np.asarray([
+            relative_rotation_angle_deg(alignment, position_fit.rotation)
+            for alignment in orientation.per_frame_alignment_rotations
+        ])
+        position_rotation_summary = summarize_angles(position_residuals)
+        position_vs_orientation = relative_rotation_angle_deg(position_fit.rotation, orientation.mean_rotation)
+        # This is the direct, convention-free angle between mapped +Z directions.
+        up_dot = np.clip(np.dot(position_fit.rotation[:, 2], orientation.mean_rotation[:, 2]), -1.0, 1.0)
+        mapped_up_axis_angle = float(np.degrees(np.arccos(up_dot)))
+
+        summary_path, frames_path = self._orientation_diagnostic_paths(self.planning_orientation_diagnostics_path)
+        summary_columns = self._orientation_summary_columns()
+        summary_row = {
+            "submap_id": submap_id, "status": "ok", "reason": "", "num_frames": len(records), "first_timestamp_ns": records[0].timestamp_ns,
+            "last_timestamp_ns": records[-1].timestamp_ns, "odom_translation_scale": self.go2_odom_translation_scale,
+            "raw_odom_path_m": float(np.linalg.norm(np.diff(raw_odom_positions, axis=0), axis=1).sum()),
+            "corrected_odom_path_m": float(np.linalg.norm(np.diff(corrected_odom_positions, axis=0), axis=1).sum()),
+            "position_sim3_scale": position_fit.scale, "position_sim3_rmse_m": position_fit.rmse,
+            "position_sim3_max_error_m": position_fit.max_error, "orientation_mean_residual_deg": orientation.mean_residual_deg,
+            "orientation_median_residual_deg": orientation.median_residual_deg, "orientation_p95_residual_deg": orientation.p95_residual_deg,
+            "orientation_max_residual_deg": orientation.max_residual_deg, "position_rotation_mean_residual_deg": position_rotation_summary["mean"],
+            "position_rotation_median_residual_deg": position_rotation_summary["median"], "position_rotation_p95_residual_deg": position_rotation_summary["p95"],
+            "position_rotation_max_residual_deg": position_rotation_summary["max"], "position_vs_orientation_angle_deg": position_vs_orientation,
+            "relative_rotation_angle_deg": position_vs_orientation, "mapped_up_axis_angle_deg": mapped_up_axis_angle,
+            "vggt_raw_det_mean": float(np.mean(projection.raw_determinants)),
+            "vggt_raw_det_min": float(np.min(projection.raw_determinants)),
+            "vggt_raw_det_max": float(np.max(projection.raw_determinants)),
+            "vggt_raw_orthogonality_error_mean": float(np.mean(projection.raw_orthogonality_errors)),
+            "vggt_raw_orthogonality_error_p95": float(np.percentile(projection.raw_orthogonality_errors, 95)),
+            "vggt_raw_orthogonality_error_max": float(np.max(projection.raw_orthogonality_errors)),
+            "vggt_projection_frobenius_error_mean": float(np.mean(projection.projection_frobenius_errors)),
+            "vggt_projection_frobenius_error_p95": float(np.percentile(projection.projection_frobenius_errors, 95)),
+            "vggt_projection_frobenius_error_max": float(np.max(projection.projection_frobenius_errors)),
+            "vggt_singular_value_min_overall": float(np.min(projection.singular_values)),
+            "vggt_singular_value_max_overall": float(np.max(projection.singular_values)),
+            "vggt_singular_value_spread_mean": float(np.mean(np.ptp(projection.singular_values, axis=1))),
+            "vggt_singular_value_spread_max": float(np.max(np.ptp(projection.singular_values, axis=1))),
+        }
+        for prefix, matrix in (("position", position_fit.rotation), ("orientation", orientation.mean_rotation)):
+            summary_row.update({f"{prefix}_r{row}{column}": float(matrix[row, column]) for row in range(3) for column in range(3)})
+            summary_row.update({f"{prefix}_vggt_z_in_odom_{axis}": float(matrix[index, 2]) for index, axis in enumerate("xyz")})
+        self._append_csv_row(summary_path, summary_columns, summary_row)
+
+        frame_columns = self._orientation_frame_columns()
+        for frame_index, (record, alignment, orientation_residual, position_residual, determinant, orthogonality_error, singular_values, projection_error) in enumerate(zip(records, orientation.per_frame_alignment_rotations, orientation.residual_angles_deg, position_residuals, projection.raw_determinants, projection.raw_orthogonality_errors, projection.singular_values, projection.projection_frobenius_errors)):
+            quaternion = Rotation.from_matrix(alignment).as_quat()
+            self._append_csv_row(frames_path, frame_columns, {
+                "submap_id": submap_id, "frame_index": frame_index, "frame_id": record.frame_id,
+                "timestamp_ns": record.timestamp_ns, "alignment_qx": quaternion[0], "alignment_qy": quaternion[1],
+                "alignment_qz": quaternion[2], "alignment_qw": quaternion[3], "orientation_mean_residual_deg": orientation_residual,
+                "position_rotation_residual_deg": position_residual, "raw_vggt_det": determinant,
+                "raw_vggt_orthogonality_error": orthogonality_error, "raw_vggt_sv0": singular_values[0],
+                "raw_vggt_sv1": singular_values[1], "raw_vggt_sv2": singular_values[2],
+                "raw_vggt_projection_frobenius_error": projection_error,
+            })
+        print(
+            f"[OrientationDiag] submap={submap_id} frames={len(records)} "
+            f"vggt_proj mean={np.mean(projection.projection_frobenius_errors):.4f} max={np.max(projection.projection_frobenius_errors):.4f} "
+            f"raw_det range=[{np.min(projection.raw_determinants):.4f}, {np.max(projection.raw_determinants):.4f}] "
+            f"orient_dispersion mean={orientation.mean_residual_deg:.2f}deg p95={orientation.p95_residual_deg:.2f}deg "
+            f"max={orientation.max_residual_deg:.2f}deg position_vs_orientation={position_vs_orientation:.2f}deg "
+            f"position_fit_rmse={position_fit.rmse:.4f}m"
+        )
 
     def set_point_cloud(self, points_in_world_frame, points_colors, name, point_size):
         if self.vis_voxel_size is not None:
@@ -259,10 +467,20 @@ class Solver:
         K_4x4[:, :3, :3] = intrinsics_cam
         world_to_cam = np.linalg.inv(cam_to_world)
 
+        # This independent debug branch must observe the raw VGGT dense cloud
+        # and Go2 odom targets, before scale-only SLAM metricization.
+        raw_centers = None
+        if self.planning_map is not None or self.metricize_submaps_from_go2 or self.planning_orientation_diagnostics_path is not None:
+            raw_centers = np.asarray([np.linalg.inv(pose)[:3, 3] for pose in world_to_cam], dtype=float)
+        if self.planning_map is not None:
+            self._add_planning_submap(raw_centers, cam_to_world[:, :3, :3], world_points, colors, conf)
+        if self.planning_orientation_diagnostics_path is not None:
+            # Raw camera-to-world rotations at the exact pre-metricization hook.
+            self._add_orientation_alignment_diagnostic(raw_centers, cam_to_world[:, :3, :3])
+
         # This happens before map insertion so add_edge observes the metricized
         # geometry and retains its existing visual scale as a residual.
         if self.metricize_submaps_from_go2:
-            raw_centers = np.asarray([np.linalg.inv(pose)[:3, 3] for pose in world_to_cam], dtype=float)
             records = self.current_working_submap.get_keyframe_records()
             if records is None or len(records) != len(raw_centers):
                 raise ValueError("metric submap keyframe metadata does not match VGGT pose count")

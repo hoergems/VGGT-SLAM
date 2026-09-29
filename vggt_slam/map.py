@@ -10,6 +10,13 @@ from vggt_slam.frame_metadata import (
     VGGTTrajectorySample,
 )
 from vggt_slam.ply_map import PLYCameraPose, PLYObjectOBB, write_map_ply
+from vggt_slam.odom_map_alignment import (
+    transform_camera_pose_se3,
+    transform_object_obb_se3,
+    transform_points_se3,
+    validate_se3,
+    verify_rigid_point_transform,
+)
 from vggt_slam.slam_utils import decompose_camera, cosine_similarity
 
 
@@ -744,3 +751,26 @@ class GraphMap:
         print(f"[MapExport] min_xyz={tuple(np.min(points, axis=0))}")
         print(f"[MapExport] max_xyz={tuple(np.max(points, axis=0))}")
         print(f"[MapExport] wrote {file_name}")
+
+    def write_odom_aligned_points_to_file(self, graph, file_name, transform_odom_vggt):
+        """Write an independent, rigidly odom-aligned PLY copy of the final map."""
+        if not str(file_name).lower().endswith(".ply"):
+            raise ValueError("odom-aligned map export supports .ply files only")
+        transform_odom_vggt = validate_se3(transform_odom_vggt, "T_odom_vggt")
+        point_cloud, ordinary_submaps = self.get_global_point_cloud(graph)
+        points_vggt = np.asarray(point_cloud.points).copy()
+        colors = np.asarray(point_cloud.colors).copy()
+        points_odom = transform_points_se3(points_vggt, transform_odom_vggt)
+        verify_rigid_point_transform(points_vggt, points_odom)
+        camera_poses = [
+            transform_camera_pose_se3(pose, transform_odom_vggt)
+            for pose in self.get_unique_optimized_camera_poses(graph)
+        ]
+        object_obbs = [
+            transform_object_obb_se3(obb, transform_odom_vggt)
+            for obb in self.object_obbs
+        ]
+        write_map_ply(file_name, points_odom, colors, camera_poses, object_obbs)
+        print(f"[OdomMapAlign] ordinary_submaps={ordinary_submaps}")
+        print(f"[OdomMapAlign] points={len(points_odom)} cameras={len(camera_poses)} object_obbs={len(object_obbs)}")
+        print(f"[OdomMapAlign] wrote {file_name}")

@@ -12,6 +12,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 import vggt_slam.slam_utils as utils
+from vggt_slam.sam3_utils import run_sam3_text_query
 from vggt_slam.solver import Solver
 from vggt_slam.submap import Submap
 
@@ -69,15 +70,9 @@ def main():
 
     print("Initializing and loading VGGT model...")
 
-
     if args.run_os:
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
         import core.vision_encoder.pe as pe
         import core.vision_encoder.transforms as transforms
-
-        sam3_model = build_sam3_image_model()
-        processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
 
         clip_model = pe.CLIP.from_config("PE-Core-L14-336", pretrained=True)  # Downloads from HF
         clip_model = clip_model.cuda()
@@ -166,6 +161,20 @@ def main():
     _export_requested_map(solver, args.map_output_path)
 
     if args.run_os:
+        # Mapping is complete and VGGT is no longer needed. Release it before
+        # constructing SAM3 so both models are not resident on the GPU at once.
+        print("Releasing VGGT model before loading SAM3...")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        print("Initializing and loading SAM3 model...")
+        sam3_model = build_sam3_image_model()
+        processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
+
         # Register the viser object-query panel so the user can search for
         # objects in the viewer in addition to the terminal prompt below.
         import threading
@@ -194,11 +203,10 @@ def main():
             with torch.no_grad():
                 # convert torch image to PIL
                 best_img = to_pil_image(best_img)
-                inference_state = processor.set_image(best_img)
-                output = processor.set_text_prompt(state=inference_state, prompt=query)
+                output = run_sam3_text_query(processor, best_img, query)
                 masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
                 print(f"Found {masks.shape[0]} masks from SAM3 for the prompt '{query}'")
-                print("Scores:", scores.cpu().numpy())
+                print("Scores:", scores.float().cpu().numpy())
 
 
             masked_img = utils.overlay_masks(best_img, masks)
@@ -206,7 +214,23 @@ def main():
 
             for i in range(masks.shape[0]):
                 mask = masks[i].cpu().numpy()
-                obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(found_submap.get_points_in_mask(overall_best_frame_index, mask, solver.graph))
+
+                points_in_mask = found_submap.get_points_in_mask(
+                    overall_best_frame_index,
+                    mask,
+                    solver.graph,
+                )
+                obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(
+                    points_in_mask
+                )
+
+                print("3D points in mask:", points_in_mask.shape)
+                print("3D min:", points_in_mask.min(axis=0))
+                print("3D max:", points_in_mask.max(axis=0))
+
+                print("OBB center:", obb_center)
+                print("OBB extent:", obb_extent)
+
                 solver.viewer.visualize_obb(
                     center=obb_center,
                     extent=obb_extent,

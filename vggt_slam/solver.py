@@ -19,6 +19,11 @@ from vggt_slam.map import GraphMap
 from vggt_slam.submap import Submap
 from vggt_slam.graph import PoseGraph
 from vggt_slam.scale_solver import estimate_scale_pairwise
+from vggt_slam.metric_submap_scale import (
+    DEFAULT_MIN_METRIC_PATH_M,
+    apply_metric_submap_scale,
+    estimate_metric_submap_scale,
+)
 from vggt_slam.viewer import Viewer
 
 DEBUG = False
@@ -39,11 +44,17 @@ class Solver:
         init_conf_threshold: float,  # represents percentage (e.g., 50 means filter lowest 50%)
         lc_thres: float = 0.80,
         vis_voxel_size: float = None,
-        vis_imgs: bool = False):
+        vis_imgs: bool = False,
+        metricize_submaps_from_go2: bool = False,
+        go2_odom_translation_scale: float = 1.20,
+        metric_submap_min_path_m: float = DEFAULT_MIN_METRIC_PATH_M):
 
         self.init_conf_threshold = init_conf_threshold
         self.vis_voxel_size = vis_voxel_size
         self.vis_imgs = vis_imgs
+        self.metricize_submaps_from_go2 = metricize_submaps_from_go2
+        self.go2_odom_translation_scale = go2_odom_translation_scale
+        self.metric_submap_min_path_m = metric_submap_min_path_m
 
         self.viewer = Viewer()
 
@@ -157,6 +168,8 @@ class Solver:
             scale_factor = scale_factor_est_output[0]
             if not is_loop_closure and not current_submap.get_lc_status():
                 current_submap.set_incoming_scale_factor(scale_factor)
+                if self.metricize_submaps_from_go2:
+                    print(f"[MetricSubmap] id={submap_id_curr} residual incoming visual scale={scale_factor:.6g}")
             H_scale = np.diag((scale_factor, scale_factor, scale_factor, 1.0))
 
             if DEBUG:
@@ -245,6 +258,31 @@ class Solver:
         K_4x4 = np.tile(np.eye(4), (N, 1, 1))
         K_4x4[:, :3, :3] = intrinsics_cam
         world_to_cam = np.linalg.inv(cam_to_world)
+
+        # This happens before map insertion so add_edge observes the metricized
+        # geometry and retains its existing visual scale as a residual.
+        if self.metricize_submaps_from_go2:
+            raw_centers = np.asarray([np.linalg.inv(pose)[:3, 3] for pose in world_to_cam], dtype=float)
+            records = self.current_working_submap.get_keyframe_records()
+            if records is None or len(records) != len(raw_centers):
+                raise ValueError("metric submap keyframe metadata does not match VGGT pose count")
+            if any(record.metric_pose is None for record in records):
+                raise ValueError("metric submap keyframe metadata is missing a metric pose")
+            metric_positions = np.asarray([record.metric_pose.position_xyz for record in records], dtype=float)
+            estimate = estimate_metric_submap_scale(
+                raw_centers, metric_positions, self.go2_odom_translation_scale,
+                self.metric_submap_min_path_m,
+            )
+            applied_scale = estimate.scale_m_per_raw_unit if estimate.accepted else 1.0
+            if estimate.accepted:
+                world_points, world_to_cam = apply_metric_submap_scale(world_points, world_to_cam, applied_scale)
+            self.current_working_submap.set_metricization_diagnostics(
+                raw_centers, estimate, applied_scale, self.go2_odom_translation_scale,
+            )
+            if estimate.accepted:
+                print(f"[MetricSubmap] id={self.current_working_submap.get_id()} frames={estimate.num_frames} status=applied raw_to_metric={applied_scale:.6g} m/u odom_cal={self.go2_odom_translation_scale:.6g} path={estimate.metric_path_length_m:.6g} m rmse={estimate.rmse_m:.6g} m")
+            else:
+                print(colored(f"[MetricSubmap] id={self.current_working_submap.get_id()} status={estimate.status}: {estimate.reason}; using raw scale", "yellow"))
 
 
         submap_id_prev = self.map.get_largest_key(ignore_loop_closure_submaps=True)

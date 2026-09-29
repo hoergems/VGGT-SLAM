@@ -9,6 +9,7 @@ import torch
 from torchvision.transforms.functional import to_pil_image
 
 import vggt_slam.slam_utils as utils
+from vggt_slam.sam3_utils import run_sam3_text_query
 from vggt_slam.solver import Solver
 from vggt_slam.cameras import BACKENDS, CameraFrame, Go2Camera, Go2ConnectionError
 from vggt_slam.frame_metadata import KeyframeRecord
@@ -63,6 +64,9 @@ parser.add_argument("--metric_trajectory_path", type=str, default=None, help="Wr
 parser.add_argument("--vggt_trajectory_path", type=str, default=None, help="Write unique timestamped optimized VGGT camera trajectory as: timestamp_ns x y z qx qy qz qw")
 parser.add_argument("--vggt_submap_trajectory_path", type=str, default=None, help="Write overlap-preserving optimized VGGT camera poses with actual ordinary-submap membership for metric-scale diagnostics")
 parser.add_argument("--vggt_scale_diagnostics_path", type=str, default=None, help="Write raw/local VGGT, final optimized VGGT, metric camera positions, and VGGT-SLAM incoming submap scale factors for offline scale diagnostics")
+parser.add_argument("--metricize_submaps_from_go2", action="store_true", help="EXPERIMENTAL: scale each ordinary VGGT submap from synchronized Go2 translation only")
+parser.add_argument("--go2_odom_translation_scale", type=float, default=1.20, help="Experimental Go2 translation calibration used only with --metricize_submaps_from_go2")
+parser.add_argument("--metric_submap_diagnostics_path", type=str, default=None, help="Write per-ordinary-submap Go2 metricization diagnostics CSV")
 parser.add_argument("--vggt_trajectory_plot_path", type=str, default=None, help="Write an XY diagnostic plot of the unaligned VGGT camera trajectory")
 parser.add_argument("--map_output_path", type=str, default=None, help="Write the final optimized colored VGGT point cloud to this file (recommended: .ply)")
 
@@ -204,20 +208,31 @@ def run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor)
         print("Score:", overall_best_score)
         with torch.no_grad():
             best_img = to_pil_image(best_img)
-            inference_state = processor.set_image(best_img)
-            output = processor.set_text_prompt(state=inference_state, prompt=query)
+            output = run_sam3_text_query(processor, best_img, query)
             masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
             print(f"Found {masks.shape[0]} masks from SAM3 for the prompt '{query}'")
-            print("Scores:", scores.cpu().numpy())
+            print("Scores:", scores.float().cpu().numpy())
 
         masked_img = utils.overlay_masks(best_img, masks)
         masked_img.show()
 
         for i in range(masks.shape[0]):
             mask = masks[i].cpu().numpy()
-            obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(
-                found_submap.get_points_in_mask(overall_best_frame_index, mask, solver.graph)
+            points_in_mask = found_submap.get_points_in_mask(
+                overall_best_frame_index, mask, solver.graph
             )
+            obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(
+                points_in_mask
+            )
+            print("3D points in mask:", points_in_mask.shape)
+            print("3D min:", points_in_mask.min(axis=0))
+            print("3D max:", points_in_mask.max(axis=0))
+            print("OBB center:", obb_center)
+            print("OBB extent:", obb_extent)
+            object_id = solver.map.add_object_obb(
+                center=obb_center, extent=obb_extent, rotation=obb_rotation
+            )
+            print(f"Stored object OBB id={object_id} for final PLY export")
             solver.viewer.visualize_obb(
                 center=obb_center,
                 extent=obb_extent,
@@ -238,6 +253,10 @@ def main():
         parser.error("--vis_voxel_size must be greater than zero when provided")
     if not np.isfinite(args.keyframe_min_sharpness) or args.keyframe_min_sharpness < 0:
         parser.error("--keyframe_min_sharpness must be finite and non-negative")
+    if not np.isfinite(args.go2_odom_translation_scale) or args.go2_odom_translation_scale <= 0:
+        parser.error("--go2_odom_translation_scale must be finite and positive")
+    if args.metricize_submaps_from_go2:
+        print(f"[MetricSubmap] ENABLED: per-submap Go2 scale metricization, odom_translation_scale={args.go2_odom_translation_scale:.6f}")
     if args.submap_policy == "metric_motion":
         if not np.isfinite(args.metric_motion_max_translation_m) or args.metric_motion_max_translation_m <= 0:
             parser.error("--metric_motion_max_translation_m must be finite and positive")
@@ -266,6 +285,8 @@ def main():
         lc_thres=args.lc_thres,
         vis_voxel_size=args.vis_voxel_size,
         vis_imgs=args.vis_imgs,
+        metricize_submaps_from_go2=args.metricize_submaps_from_go2,
+        go2_odom_translation_scale=args.go2_odom_translation_scale,
     )
 
     open3d_viewer = None
@@ -279,18 +300,14 @@ def main():
     print("Initializing and loading VGGT model...")
 
     if args.run_os:
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
         import core.vision_encoder.pe as pe
         import core.vision_encoder.transforms as transforms
-
-        sam3_model = build_sam3_image_model()
-        processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
 
         clip_model = pe.CLIP.from_config("PE-Core-L14-336", pretrained=True)  # Downloads from HF
         clip_model = clip_model.cuda()
         clip_tokenizer = transforms.get_text_tokenizer(clip_model.context_length)
         clip_preprocess = transforms.get_image_transform(clip_model.image_size)
+        processor = None
     else:
         clip_model, clip_preprocess = None, None
         clip_tokenizer, processor = None, None
@@ -303,11 +320,6 @@ def main():
     model = model.to(torch.bfloat16)  # use half precision
     model = model.to(device)
     print("All models loaded. Starting SLAM loop.")
-
-    # Register the viser object-query panel so the user can search for objects
-    # live (and after capture) without using the terminal.
-    if args.run_os:
-        solver.viewer.add_object_query_gui(solver, clip_model, clip_tokenizer, processor, data_lock)
 
     # --- Camera setup ---
     camera = create_camera(args)
@@ -552,6 +564,25 @@ def main():
         open3d_viewer.update(point_cloud)
 
     if args.run_os:
+        # Mapping is complete and no future submap can use VGGT. Release it
+        # before SAM3 construction so the two large models never coexist.
+        print("Releasing VGGT model before loading SAM3...")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        print("Initializing and loading SAM3 model...")
+        sam3_model = build_sam3_image_model()
+        processor = Sam3Processor(sam3_model, confidence_threshold=0.50)
+
+        # Live queries are deliberately unavailable during capture. Register
+        # the Viser panel now that SAM3 is present for post-capture queries.
+        solver.viewer.add_object_query_gui(
+            solver, clip_model, clip_tokenizer, processor, data_lock
+        )
         run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor)
 
     if args.metric_trajectory_path is not None:
@@ -579,6 +610,9 @@ def main():
             args.vggt_scale_diagnostics_path,
             solver.graph,
         )
+
+    if args.metric_submap_diagnostics_path is not None:
+        solver.map.write_metric_submap_diagnostics_to_file(args.metric_submap_diagnostics_path)
 
     if args.map_output_path is not None:
         solver.map.write_points_to_file(solver.graph, args.map_output_path)

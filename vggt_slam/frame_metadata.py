@@ -76,12 +76,13 @@ class VGGTSubmapTrajectorySample:
 class VGGTScaleDiagnosticSample:
     """One ordinary-submap occurrence for raw/final/metric scale analysis.
 
-    ``raw_vggt_position_xyz`` is the local VGGT camera center before graph
-    alignment; ``optimized_vggt_position_xyz`` is the final graph-optimized
-    camera center; and ``metric_position_xyz`` is the synchronized Go2
-    optical-camera position in metric odom coordinates.  The optional
-    ``incoming_scale_factor`` is the existing current-raw to previous-raw
-    point-cloud alignment factor, not a metric scale.
+    ``raw_vggt_position_xyz`` is the original local VGGT camera center before
+    optional Go2 metricization and graph alignment;
+    ``optimized_vggt_position_xyz`` is the final graph-optimized camera
+    center; and ``metric_position_xyz`` is the synchronized Go2 optical-camera
+    position in metric odom coordinates.  The optional ``incoming_scale_factor``
+    is the existing current-raw to previous-raw point-cloud alignment factor,
+    not a metric scale.
     """
 
     timestamp_ns: int

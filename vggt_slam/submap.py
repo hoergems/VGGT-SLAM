@@ -54,6 +54,10 @@ class Submap:
         self.img_names = []
         self.semantic_vectors = []
         self.incoming_scale_factor = None
+        self.raw_vggt_camera_centers_before_metricization = None
+        self.metric_submap_scale_estimate = None
+        self.applied_metric_scale = 1.0
+        self.metric_odom_translation_scale = None
         self.window_metadata = None
     
     def set_lc_status(self, is_lc_submap):
@@ -92,6 +96,32 @@ class Submap:
 
     def get_incoming_scale_factor(self):
         return self.incoming_scale_factor
+
+    def set_metricization_diagnostics(self, raw_centers, estimate, applied_scale=1.0, odom_translation_scale=None):
+        raw_centers = np.asarray(raw_centers, dtype=float)
+        if raw_centers.ndim != 2 or raw_centers.shape[1:] != (3,) or not np.isfinite(raw_centers).all():
+            raise ValueError("raw VGGT camera centers must be a finite N x 3 array")
+        applied_scale = float(applied_scale)
+        if not np.isfinite(applied_scale) or applied_scale <= 0:
+            raise ValueError("applied metric scale must be finite and positive")
+        self.raw_vggt_camera_centers_before_metricization = raw_centers.copy()
+        self.metric_submap_scale_estimate = estimate
+        self.applied_metric_scale = applied_scale
+        self.metric_odom_translation_scale = odom_translation_scale
+
+    def get_raw_vggt_camera_centers_before_metricization(self):
+        if self.raw_vggt_camera_centers_before_metricization is None:
+            return self.get_local_camera_centers()
+        return self.raw_vggt_camera_centers_before_metricization.copy()
+
+    def get_metric_submap_scale_estimate(self):
+        return self.metric_submap_scale_estimate
+
+    def get_applied_metric_scale(self):
+        return self.applied_metric_scale
+
+    def get_metric_odom_translation_scale(self):
+        return self.metric_odom_translation_scale
 
     def set_window_metadata(self, metadata):
         """Store online window-policy metadata for an ordinary submap."""

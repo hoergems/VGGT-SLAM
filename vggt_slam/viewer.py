@@ -183,6 +183,7 @@ class Viewer:
         """
         import torch
         from torchvision.transforms.functional import to_pil_image
+        from vggt_slam.sam3_utils import run_sam3_text_query
         import vggt_slam.slam_utils as utils
 
         with self.server.gui.add_folder("Object Query"):
@@ -210,8 +211,7 @@ class Viewer:
 
                     with torch.no_grad():
                         pil_img = to_pil_image(best_img)
-                        inference_state = processor.set_image(pil_img)
-                        output = processor.set_text_prompt(state=inference_state, prompt=query)
+                        output = run_sam3_text_query(processor, pil_img, query)
                         masks = output["masks"]
 
                     n = masks.shape[0]
@@ -220,6 +220,10 @@ class Viewer:
                         obb_center, obb_extent, obb_rotation = utils.compute_obb_from_points(
                             found_submap.get_points_in_mask(best_frame_index, mask, solver.graph)
                         )
+                        object_id = solver.map.add_object_obb(
+                            center=obb_center, extent=obb_extent, rotation=obb_rotation
+                        )
+                        print(f"Stored object OBB id={object_id} for final PLY export")
                         self.visualize_obb(
                             center=obb_center,
                             extent=obb_extent,

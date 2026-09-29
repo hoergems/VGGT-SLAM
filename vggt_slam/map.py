@@ -9,7 +9,7 @@ from vggt_slam.frame_metadata import (
     VGGTSubmapTrajectorySample,
     VGGTTrajectorySample,
 )
-from vggt_slam.ply_map import PLYCameraPose, write_map_ply
+from vggt_slam.ply_map import PLYCameraPose, PLYObjectOBB, write_map_ply
 from vggt_slam.slam_utils import decompose_camera, cosine_similarity
 
 
@@ -51,6 +51,32 @@ class GraphMap:
         self.submaps = dict()
         self.rectifying_H_mats = []
         self.non_lc_submap_ids = []
+        self.object_obbs = []
+
+    def add_object_obb(self, center, extent, rotation) -> int:
+        """Persist one computed world-space OBB for the current map session.
+
+        ``compute_obb_from_points`` supplies a rotation whose columns are the
+        local principal axes in world coordinates.  Flattening it row-major
+        preserves the matrix used by the visualizers.
+        """
+        center = np.asarray(center, dtype=float)
+        extent = np.asarray(extent, dtype=float)
+        rotation = np.asarray(rotation, dtype=float)
+        if center.shape != (3,) or extent.shape != (3,) or rotation.shape != (3, 3):
+            raise ValueError("object OBB must have center (3), extent (3), and rotation (3, 3)")
+        if not np.isfinite(np.concatenate((center, extent, rotation.ravel()))).all():
+            raise ValueError("object OBB values must be finite")
+        if (extent <= 0).any():
+            raise ValueError("object OBB extents must be strictly positive")
+        object_id = len(self.object_obbs)
+        self.object_obbs.append(PLYObjectOBB(
+            object_id=object_id,
+            center_xyz=tuple(float(value) for value in center),
+            extent_xyz=tuple(float(value) for value in extent),
+            rotation_matrix=tuple(float(value) for value in rotation.ravel(order="C")),
+        ))
+        return object_id
     
     def get_num_submaps(self):
         return len(self.submaps)
@@ -423,7 +449,7 @@ class GraphMap:
             if not any(record.timestamp_ns is not None for record in records):
                 continue
             frame_ids = submap.get_frame_ids()
-            raw_centers = submap.get_local_camera_centers()
+            raw_centers = submap.get_raw_vggt_camera_centers_before_metricization() if hasattr(submap, "get_raw_vggt_camera_centers_before_metricization") else submap.get_local_camera_centers()
             projection_mats = submap.get_all_poses_world(graph, give_camera_mat=True)
             if not (len(records) == len(frame_ids) == len(raw_centers) == len(projection_mats)):
                 raise ValueError(
@@ -455,6 +481,31 @@ class GraphMap:
                     incoming_scale_factor=incoming_scale_factor,
                 ))
         return samples
+
+    def write_metric_submap_diagnostics_to_file(self, file_name):
+        """Write one CSV row per ordinary submap for Go2 metricization analysis."""
+        import csv
+        columns = ["submap_id", "num_frames", "status", "odom_translation_scale", "metric_path_m", "metric_displacement_m", "raw_path_units", "raw_displacement_units", "raw_to_metric_scale_m_per_unit", "fit_rmse_m", "fit_max_error_m", "applied_scale_m_per_unit", "incoming_visual_scale"]
+        rows = []
+        for submap in self.ordered_submaps_by_key():
+            if submap.get_lc_status() or not hasattr(submap, "get_metric_submap_scale_estimate"):
+                continue
+            estimate = submap.get_metric_submap_scale_estimate()
+            if estimate is None:
+                continue
+            rows.append({
+                "submap_id": submap.get_id(), "num_frames": estimate.num_frames, "status": estimate.status,
+                "odom_translation_scale": submap.get_metric_odom_translation_scale(), "metric_path_m": estimate.metric_path_length_m,
+                "metric_displacement_m": estimate.metric_displacement_m, "raw_path_units": estimate.raw_path_length,
+                "raw_displacement_units": estimate.raw_displacement, "raw_to_metric_scale_m_per_unit": estimate.scale_m_per_raw_unit,
+                "fit_rmse_m": estimate.rmse_m, "fit_max_error_m": estimate.max_error_m,
+                "applied_scale_m_per_unit": submap.get_applied_metric_scale(), "incoming_visual_scale": submap.get_incoming_scale_factor(),
+            })
+        with open(file_name, "w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[MetricSubmap] wrote {file_name} ({len(rows)} ordinary submaps)")
 
     @staticmethod
     def plot_vggt_camera_trajectory(samples, output_path) -> None:
@@ -678,7 +729,9 @@ class GraphMap:
         point_cloud, ordinary_submaps = self.get_global_point_cloud(graph)
         if str(file_name).lower().endswith(".ply"):
             camera_poses = self.get_unique_optimized_camera_poses(graph)
-            write_map_ply(file_name, point_cloud.points, point_cloud.colors, camera_poses)
+            write_map_ply(
+                file_name, point_cloud.points, point_cloud.colors, camera_poses, self.object_obbs
+            )
         elif not o3d.io.write_point_cloud(str(file_name), point_cloud):
             raise IOError(f"failed to write point cloud to {file_name}")
 
@@ -687,6 +740,7 @@ class GraphMap:
         print(f"[MapExport] points={len(points)}")
         if str(file_name).lower().endswith(".ply"):
             print(f"[MapExport] cameras={len(camera_poses)}")
+            print(f"[MapExport] object_obbs={len(self.object_obbs)}")
         print(f"[MapExport] min_xyz={tuple(np.min(points, axis=0))}")
         print(f"[MapExport] max_xyz={tuple(np.max(points, axis=0))}")
         print(f"[MapExport] wrote {file_name}")

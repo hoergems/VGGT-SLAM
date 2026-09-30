@@ -295,7 +295,7 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--point_cloud",
+        "point_cloud",
         type=Path,
         help="Path to a point cloud, such as vggt_map.ply",
     )

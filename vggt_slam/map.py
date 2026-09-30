@@ -76,6 +76,10 @@ class GraphMap:
             raise ValueError("object OBB values must be finite")
         if (extent <= 0).any():
             raise ValueError("object OBB extents must be strictly positive")
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-7):
+            raise ValueError("object OBB rotation must be orthonormal")
+        if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-7):
+            raise ValueError("object OBB rotation must be a proper rotation")
         object_id = len(self.object_obbs)
         self.object_obbs.append(PLYObjectOBB(
             object_id=object_id,
@@ -752,8 +756,11 @@ class GraphMap:
         print(f"[MapExport] max_xyz={tuple(np.max(points, axis=0))}")
         print(f"[MapExport] wrote {file_name}")
 
-    def write_odom_aligned_points_to_file(self, graph, file_name, transform_odom_vggt):
-        """Write an independent, rigidly odom-aligned PLY copy of the final map."""
+    def write_odom_aligned_points_to_file(
+        self, graph, file_name, transform_odom_vggt, *, verify_points=True,
+        log_prefix="[OdomMapAlign]", log_summary=True
+    ):
+        """Write a complete graph-optimized map rigidly transformed into odom."""
         if not str(file_name).lower().endswith(".ply"):
             raise ValueError("odom-aligned map export supports .ply files only")
         transform_odom_vggt = validate_se3(transform_odom_vggt, "T_odom_vggt")
@@ -761,7 +768,8 @@ class GraphMap:
         points_vggt = np.asarray(point_cloud.points).copy()
         colors = np.asarray(point_cloud.colors).copy()
         points_odom = transform_points_se3(points_vggt, transform_odom_vggt)
-        verify_rigid_point_transform(points_vggt, points_odom)
+        if verify_points:
+            verify_rigid_point_transform(points_vggt, points_odom)
         camera_poses = [
             transform_camera_pose_se3(pose, transform_odom_vggt)
             for pose in self.get_unique_optimized_camera_poses(graph)
@@ -771,6 +779,8 @@ class GraphMap:
             for obb in self.object_obbs
         ]
         write_map_ply(file_name, points_odom, colors, camera_poses, object_obbs)
-        print(f"[OdomMapAlign] ordinary_submaps={ordinary_submaps}")
-        print(f"[OdomMapAlign] points={len(points_odom)} cameras={len(camera_poses)} object_obbs={len(object_obbs)}")
-        print(f"[OdomMapAlign] wrote {file_name}")
+        if log_summary:
+            print(f"{log_prefix} ordinary_submaps={ordinary_submaps}")
+            print(f"{log_prefix} points={len(points_odom)} cameras={len(camera_poses)} object_obbs={len(object_obbs)}")
+            print(f"{log_prefix} wrote {file_name}")
+        return ordinary_submaps, len(points_odom)

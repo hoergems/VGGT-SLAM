@@ -159,6 +159,12 @@ def compute_obb_from_points(points: np.ndarray):
     order = np.argsort(eigvals)[::-1]
     eigvecs = eigvecs[:, order]
 
+    # Eigenvector signs are arbitrary.  Flip one axis when needed so the
+    # principal-axis basis is a right-handed SO(3) rotation rather than a
+    # reflection.  This preserves the represented OBB geometry.
+    if np.linalg.det(eigvecs) < 0.0:
+        eigvecs[:, -1] *= -1.0
+
     rotation = eigvecs  # columns = principal axes (R)
 
     # 3. Project points to PCA frame

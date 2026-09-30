@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 import threading
 import argparse
@@ -23,7 +24,7 @@ from vggt_slam.odom_map_alignment import (
     trajectory_alignment_diagnostics,
     write_trajectory_alignment_csv,
 )
-from vggt_slam.submap_window import MetricMotionWindowState, SubmapWindowMetadata
+from vggt_slam.incremental_odom_map import IncrementalOdomMapSnapshot
 
 from vggt.models.vggt import VGGT
 
@@ -48,10 +49,6 @@ parser.add_argument("--vis_flow", action="store_true", help="Visualize optical f
 parser.add_argument("--run_os", action="store_true", help="Enable open-set semantic search with Perception Encoder CLIP and SAM3")
 parser.add_argument("--submap_size", type=int, default=16, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
 parser.add_argument("--overlapping_window_size", type=int, default=1, help="Number of overlapping frames retained between fixed-policy submaps")
-parser.add_argument("--submap_policy", choices=("fixed", "metric_motion"), default="fixed", help="Submap window policy. 'fixed' preserves the existing submap_size + overlap behavior. 'metric_motion' closes a Go2 submap when cumulative metric translation, cumulative rotation, or the maximum keyframe count is reached.")
-parser.add_argument("--metric_motion_max_translation_m", type=float, default=1.5, help="Metric-motion policy cumulative camera-path limit in metres")
-parser.add_argument("--metric_motion_max_rotation_deg", type=float, default=90.0, help="Metric-motion policy cumulative camera-rotation limit in degrees")
-parser.add_argument("--metric_motion_max_keyframes", type=int, default=17, help="Metric-motion policy maximum VGGT keyframes, including overlap")
 parser.add_argument("--max_loops", type=int, default=1, help="ONLY DEFAULT OF 1 SUPPORTED RIGHT NOW or 0 to disable loop closures.")
 parser.add_argument("--min_disparity", type=float, default=50, help="Minimum disparity to generate a new keyframe")
 parser.add_argument(
@@ -78,11 +75,26 @@ parser.add_argument("--metric_submap_diagnostics_path", type=str, default=None, 
 parser.add_argument("--vggt_trajectory_plot_path", type=str, default=None, help="Write an XY diagnostic plot of the unaligned VGGT camera trajectory")
 parser.add_argument("--map_output_path", type=str, default=None, help="Write the final optimized colored VGGT point cloud to this file (recommended: .ply)")
 parser.add_argument("--odom_aligned_map_output_path", type=str, default=None, help="EXPERIMENTAL: export the final graph-optimized metric VGGT map rigidly aligned to Go2 odom using the first synchronized optical-camera pose (.ply only)")
+parser.add_argument("--planning_map_output_path", type=str, default=None, help="Write/replace the current complete graph-optimized map in Go2 odom after every ordinary-submap optimization (.ply only; requires Go2 metricization)")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def reset_keyframe_folder(keyframe_folder: str) -> None:
+    """Clear and recreate the configured keyframe output directory."""
+    if not keyframe_folder.strip():
+        raise ValueError("Keyframe folder path must not be empty")
+    if os.path.exists(keyframe_folder):
+        if not os.path.isdir(keyframe_folder):
+            raise ValueError(
+                f"Keyframe folder path exists but is not a directory: {keyframe_folder}"
+            )
+        shutil.rmtree(keyframe_folder)
+
+    os.makedirs(keyframe_folder, exist_ok=True)
+
 
 def save_keyframe(frame: CameraFrame, folder: str, frame_count: int) -> KeyframeRecord:
     """Persist one keyframe while retaining its source identity and metadata."""
@@ -165,7 +177,7 @@ def should_flush_final_fixed_window(num_records, completed_submaps, overlap_size
     return num_records > overlap_size
 
 
-def threaded_process_submap(keyframe_records, solver, model, args, clip_model, clip_preprocess, window_metadata=None):
+def threaded_process_submap(keyframe_records, solver, model, args, clip_model, clip_preprocess, planning_map_snapshot=None):
     """Background thread: run VGGT inference + graph optimisation for one submap."""
     try:
         image_names = [record.image_path for record in keyframe_records]
@@ -174,11 +186,11 @@ def threaded_process_submap(keyframe_records, solver, model, args, clip_model, c
             image_names, model, args.max_loops, clip_model, clip_preprocess,
             keyframe_records=keyframe_records,
         )
-        if window_metadata is not None:
-            solver.current_working_submap.set_window_metadata(window_metadata)
         with data_lock:
             solver.add_points(predictions)
             solver.graph.optimize()
+            if planning_map_snapshot is not None:
+                planning_map_snapshot.update(solver)
             if args.vis_map:
                 if len(predictions.get("detected_loops", [])) > 0:
                     solver.update_all_submap_vis()
@@ -264,22 +276,19 @@ def main():
         parser.error("--keyframe_min_sharpness must be finite and non-negative")
     if not np.isfinite(args.go2_odom_translation_scale) or args.go2_odom_translation_scale <= 0:
         parser.error("--go2_odom_translation_scale must be finite and positive")
+    if args.planning_map_output_path is not None:
+        if not args.metricize_submaps_from_go2:
+            parser.error("--planning_map_output_path requires --metricize_submaps_from_go2")
+        if args.camera != "go2":
+            parser.error("--planning_map_output_path requires --camera go2")
+        if not args.planning_map_output_path.lower().endswith(".ply"):
+            parser.error("--planning_map_output_path supports .ply files only")
     if args.metricize_submaps_from_go2:
         print(f"[MetricSubmap] ENABLED: per-submap Go2 scale metricization, odom_translation_scale={args.go2_odom_translation_scale:.6f}")
-    if args.submap_policy == "metric_motion":
-        if not np.isfinite(args.metric_motion_max_translation_m) or args.metric_motion_max_translation_m <= 0:
-            parser.error("--metric_motion_max_translation_m must be finite and positive")
-        if not np.isfinite(args.metric_motion_max_rotation_deg) or args.metric_motion_max_rotation_deg <= 0:
-            parser.error("--metric_motion_max_rotation_deg must be finite and positive")
-        if args.metric_motion_max_keyframes < args.overlapping_window_size + 2:
-            parser.error("--metric_motion_max_keyframes must be at least overlap + 2")
-        print("[SubmapPolicy] policy=metric_motion")
-        print(f"[SubmapPolicy] max_translation_m={args.metric_motion_max_translation_m}")
-        print(f"[SubmapPolicy] max_rotation_deg={args.metric_motion_max_rotation_deg}")
-        print(f"[SubmapPolicy] max_keyframes={args.metric_motion_max_keyframes}")
-        print(f"[SubmapPolicy] overlap={args.overlapping_window_size}")
-    else:
-        print(f"[SubmapPolicy] policy=fixed new_frames={args.submap_size} overlap={args.overlapping_window_size} target_frames={args.submap_size + args.overlapping_window_size}")
+    print(f"[SubmapPolicy] policy=fixed new_frames={args.submap_size} overlap={args.overlapping_window_size} target_frames={args.submap_size + args.overlapping_window_size}")
+
+    reset_keyframe_folder(args.keyframe_folder)
+    print(f"[Keyframes] Cleared keyframe folder: {args.keyframe_folder}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -296,6 +305,10 @@ def main():
         vis_imgs=args.vis_imgs,
         metricize_submaps_from_go2=args.metricize_submaps_from_go2,
         go2_odom_translation_scale=args.go2_odom_translation_scale,
+    )
+    planning_map_snapshot = (
+        IncrementalOdomMapSnapshot(args.planning_map_output_path)
+        if args.planning_map_output_path is not None else None
     )
 
     open3d_viewer = None
@@ -333,7 +346,6 @@ def main():
     # --- Camera setup ---
     camera = create_camera(args)
     print(f"Initializing {args.camera} camera...")
-    os.makedirs(args.keyframe_folder, exist_ok=True)
     camera.start()
 
     # Warm up the camera — first few frames can be None
@@ -368,13 +380,6 @@ def main():
     frame_count = 0
     keyframe_records = []
     target_size = args.submap_size + args.overlapping_window_size
-    metric_window = None
-    if args.submap_policy == "metric_motion":
-        metric_window = MetricMotionWindowState(
-            args.metric_motion_max_translation_m,
-            args.metric_motion_max_rotation_deg,
-            args.metric_motion_max_keyframes,
-        )
     submap_count = 0
     last_status_frame = 0  # for console status throttle when display is off
     stop_event = threading.Event()
@@ -434,73 +439,42 @@ def main():
                     solver.flow_tracker.accept_keyframe(img)
                     selected_record = save_keyframe(frame, args.keyframe_folder, frame_count)
 
-            if args.submap_policy == "fixed":
-                if selected_record is not None:
-                    keyframe_records.append(selected_record)
-                if len(keyframe_records) >= target_size:
-                    if solver_lock.acquire(blocking=False):
-                        submap_count += 1
-                        print(f"[Main] Launching submap {submap_count} (frame {frame_count})...")
-                        go2_records = [record for record in keyframe_records if record.timestamp_ns is not None]
-                        if go2_records:
-                            print(
-                                f"[Main]   frames={len(keyframe_records)} "
-                                f"first_timestamp_ns={go2_records[0].timestamp_ns} "
-                                f"last_timestamp_ns={go2_records[-1].timestamp_ns} "
-                                f"metric_poses={sum(record.metric_pose is not None for record in go2_records)}/{len(go2_records)}"
-                            )
-                        metadata = SubmapWindowMetadata("fixed", "max_keyframes", None, None, len(keyframe_records))
-                        t = threading.Thread(target=threaded_process_submap,
-                            args=(list(keyframe_records), solver, model, args, clip_model, clip_preprocess, metadata), daemon=True)
-                        t.start()
-                        keyframe_records = retain_fixed_window_overlap(
-                            keyframe_records, args.overlapping_window_size
-                        )
-                    else:
-                        # SLAM still busy; cap the backlog so we don't grow unbounded.
-                        if len(keyframe_records) > target_size * 2:
-                            num_dropped = len(keyframe_records) - target_size
-                            print(
-                                f"\033[93m[WARNING] Dropping {num_dropped} pending keyframe records "
-                                f"(backlog={len(keyframe_records)}, keeping={target_size})\033[0m"
-                            )
-                            keyframe_records = keyframe_records[-target_size:]
-            elif selected_record is not None:
-                metric_window.add_selected(selected_record)
-
-            if args.submap_policy == "metric_motion" and metric_window.ready_records is not None:
+            if selected_record is not None:
+                keyframe_records.append(selected_record)
+            if len(keyframe_records) >= target_size:
                 if solver_lock.acquire(blocking=False):
-                    launched_records, status = metric_window.launch_ready(args.overlapping_window_size)
                     submap_count += 1
-                    print(f"[SubmapPolicy] ready policy=metric_motion frames={status.num_keyframes}")
-                    print(f"[SubmapPolicy] path_m={status.cumulative_translation_m:.6g} total_rot_deg={status.cumulative_rotation_deg:.6g}")
-                    print(f"[SubmapPolicy] trigger={status.trigger_reason}")
                     print(f"[Main] Launching submap {submap_count} (frame {frame_count})...")
-                    print(f"[Main]   frames={len(launched_records)} first_timestamp_ns={launched_records[0].timestamp_ns} last_timestamp_ns={launched_records[-1].timestamp_ns} metric_poses={len(launched_records)}/{len(launched_records)}")
-                    metadata = SubmapWindowMetadata("metric_motion", status.trigger_reason,
-                                                     status.cumulative_translation_m,
-                                                     status.cumulative_rotation_deg, status.num_keyframes)
-                    t = threading.Thread(
-                        target=threaded_process_submap,
-                        args=(launched_records, solver, model, args, clip_model, clip_preprocess, metadata),
-                        daemon=True,
-                    )
+                    go2_records = [record for record in keyframe_records if record.timestamp_ns is not None]
+                    if go2_records:
+                        print(
+                            f"[Main]   frames={len(keyframe_records)} "
+                            f"first_timestamp_ns={go2_records[0].timestamp_ns} "
+                            f"last_timestamp_ns={go2_records[-1].timestamp_ns} "
+                            f"metric_poses={sum(record.metric_pose is not None for record in go2_records)}/{len(go2_records)}"
+                        )
+                    t = threading.Thread(target=threaded_process_submap,
+                        args=(list(keyframe_records), solver, model, args, clip_model, clip_preprocess, planning_map_snapshot), daemon=True)
                     t.start()
+                    keyframe_records = retain_fixed_window_overlap(
+                        keyframe_records, args.overlapping_window_size
+                    )
+                else:
+                    # SLAM still busy; cap the backlog so we don't grow unbounded.
+                    if len(keyframe_records) > target_size * 2:
+                        num_dropped = len(keyframe_records) - target_size
+                        print(
+                            f"\033[93m[WARNING] Dropping {num_dropped} pending keyframe records "
+                            f"(backlog={len(keyframe_records)}, keeping={target_size})\033[0m"
+                        )
+                        keyframe_records = keyframe_records[-target_size:]
 
-            kf = len(keyframe_records) if args.submap_policy == "fixed" else len(metric_window.active_records)
+            kf = len(keyframe_records)
             slam_busy = solver_lock.locked()
 
             if use_display:
                 display = img.copy()
-                if args.submap_policy == "fixed":
-                    status = f"KFs: {kf}/{target_size}  Submaps: {submap_count}"
-                elif metric_window.ready_records is not None:
-                    status = f"KFs: READY  pending: {len(metric_window.pending_records)}  Submaps: {submap_count}"
-                else:
-                    window_status = metric_window.evaluate_active()
-                    status = (f"KFs: {kf}/{args.metric_motion_max_keyframes}  "
-                              f"path: {window_status.cumulative_translation_m:.2f}/{args.metric_motion_max_translation_m:.2f}m  "
-                              f"rot: {window_status.cumulative_rotation_deg:.0f}/{args.metric_motion_max_rotation_deg:.0f}deg  Submaps: {submap_count}")
+                status = f"KFs: {kf}/{target_size}  Submaps: {submap_count}"
                 if slam_busy:
                     status += "  [SLAM running]"
                 cv2.putText(display, status, (8, 22),
@@ -511,13 +485,7 @@ def main():
             else:
                 if frame_count - last_status_frame >= 30:
                     busy_str = "  [SLAM running]" if slam_busy else ""
-                    if args.submap_policy == "fixed":
-                        print(f"[Camera] frame={frame_count}  KFs={kf}/{target_size} submaps={submap_count}{busy_str}")
-                    elif metric_window.ready_records is not None:
-                        print(f"[Camera] frame={frame_count} KFs=READY pending={len(metric_window.pending_records)} submaps={submap_count}{busy_str}")
-                    else:
-                        window_status = metric_window.evaluate_active()
-                        print(f"[Camera] frame={frame_count} KFs={kf}/{args.metric_motion_max_keyframes} path_m={window_status.cumulative_translation_m:.6g} total_rot_deg={window_status.cumulative_rotation_deg:.6g} pending={len(metric_window.pending_records)} submaps={submap_count}{busy_str}")
+                    print(f"[Camera] frame={frame_count}  KFs={kf}/{target_size} submaps={submap_count}{busy_str}")
                     last_status_frame = frame_count
 
             if open3d_viewer is not None and open3d_viewer.is_active:
@@ -544,20 +512,17 @@ def main():
     # The fixed-policy buffer now cannot race an ordinary background launch.
     # Reconstruct a short stream in full, or a tail containing new records in
     # addition to the overlap retained by a previous ordinary submap.
-    if args.submap_policy == "fixed" and should_flush_final_fixed_window(
+    if should_flush_final_fixed_window(
         len(keyframe_records), submap_count, args.overlapping_window_size
     ):
         final_records = list(keyframe_records)
         submap_count += 1
         print(f"[Main] Flushing final partial submap ({len(final_records)} frames)...")
-        metadata = SubmapWindowMetadata(
-            "fixed", "end_of_stream", None, None, len(final_records)
-        )
         # Capture has ended, so running the existing path synchronously makes
         # completion before final outputs explicit and deterministic.
         solver_lock.acquire()
         threaded_process_submap(
-            final_records, solver, model, args, clip_model, clip_preprocess, metadata
+            final_records, solver, model, args, clip_model, clip_preprocess, planning_map_snapshot
         )
 
     print("Total number of submaps in map", solver.map.get_num_submaps())
@@ -630,6 +595,13 @@ def main():
         metric_samples = solver.map.get_metric_camera_trajectory()
         vggt_samples = solver.map.get_vggt_camera_trajectory(solver.graph)
         alignment = build_first_frame_odom_alignment(metric_samples, vggt_samples)
+        if planning_map_snapshot is not None:
+            if not np.allclose(
+                planning_map_snapshot.transform_odom_vggt,
+                alignment.transform_odom_vggt,
+                atol=1e-8,
+            ):
+                raise ValueError("planning-map and final odom-map first-frame transforms disagree")
 
         p0_odom = np.asarray(alignment.metric_sample.position_xyz, dtype=float)
         print(

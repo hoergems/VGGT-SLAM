@@ -58,7 +58,6 @@ class Submap:
         self.metric_submap_scale_estimate = None
         self.applied_metric_scale = 1.0
         self.metric_odom_translation_scale = None
-        self.window_metadata = None
     
     def set_lc_status(self, is_lc_submap):
         self.is_lc_submap = is_lc_submap
@@ -122,15 +121,6 @@ class Submap:
 
     def get_metric_odom_translation_scale(self):
         return self.metric_odom_translation_scale
-
-    def set_window_metadata(self, metadata):
-        """Store online window-policy metadata for an ordinary submap."""
-        if self.is_lc_submap:
-            raise ValueError("window metadata must not be attached to loop-closure submaps")
-        self.window_metadata = metadata
-
-    def get_window_metadata(self):
-        return self.window_metadata
 
     def get_conf_threshold(self):
         return self.conf_threshold

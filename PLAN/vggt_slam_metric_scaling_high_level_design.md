@@ -64,7 +64,9 @@ without the planner having to understand arbitrary monocular VGGT units.
 An earlier design treated the final VGGT-SLAM map as globally consistent
 but arbitrary-scale and proposed estimating a single quantity
 
-\[ s\_{`\mathrm{to\_metric}`{=tex}} \]
+$$
+s_{\mathrm{to\_metric}}
+$$
 
 afterward.
 
@@ -117,7 +119,9 @@ monocular units.
 For scale estimation, the relevant quantity is the raw VGGT camera
 center
 
-\[ `\mathbf `{=tex}p_j\^V. \]
+$$
+\mathbf{p}_j^V.
+$$
 
 ### 3.2 Synchronized metric Go2 camera pose
 
@@ -130,15 +134,15 @@ optical-camera pose before metric scale estimation.
 
 The nominal front-camera origin in the Go2 body frame is
 
-\[ {}\^B`\mathbf `{=tex}t_C =
-```{=tex}
+$$
+{}^B\mathbf{t}_C =
 \begin{bmatrix}
 0.32715\\
 -0.00003\\
 0.04297
 \end{bmatrix}
-```
-`\mathrm{\ m}`{=tex}. \]
+\mathrm{\ m}.
+$$
 
 The optical-axis convention is:
 
@@ -148,11 +152,12 @@ optical y/down  = -body z
 optical z/fwd   =  body x
 ```
 
-For body pose ((R_B^O,`\mathbf `{=tex}p_B^O)), the metric camera origin
-is
+For body pose $(R_B^O,\mathbf{p}_B^O)$, the metric camera origin is
 
-\[ `\mathbf `{=tex}p_C\^O = `\mathbf `{=tex}p_B\^O +
-R_B^O,{}^B`\mathbf `{=tex}t_C. \]
+$$
+\mathbf{p}_C^O =
+\mathbf{p}_B^O + R_B^O\,{}^B\mathbf{t}_C.
+$$
 
 This camera-origin correction matters particularly during rotation
 because the front camera is offset from the body origin.
@@ -170,11 +175,15 @@ underestimates translational distance.
 The current implementation therefore applies a configurable calibration
 factor
 
-\[ c\_{`\mathrm{odom}`{=tex}}, \]
+$$
+c_{\mathrm{odom}},
+$$
 
 currently defaulting to
 
-\[ c\_{`\mathrm{odom}`{=tex}} = 1.20. \]
+$$
+c_{\mathrm{odom}} = 1.20.
+$$
 
 It is exposed as:
 
@@ -185,9 +194,13 @@ It is exposed as:
 For one submap, the local calibrated metric trajectory used for fitting
 is
 
-\[ `\tilde{\mathbf p}`{=tex}*j\^O = c*{`\mathrm{odom}`{=tex}}
-`\left`{=tex}( `\mathbf `{=tex}p_j^O-`\mathbf `{=tex}p_0^O
-`\right`{=tex}). \]
+$$
+\tilde{\mathbf{p}}_j^O =
+c_{\mathrm{odom}}
+\left(
+\mathbf{p}_j^O - \mathbf{p}_0^O
+\right).
+$$
 
 Subtracting the first camera position removes the arbitrary global
 odometry origin. Only relative camera translation within the submap is
@@ -208,22 +221,29 @@ proper-rotation similarity transform between:
 
 Conceptually,
 
-\[ `\tilde{\mathbf p}`{=tex}\_j\^O `\approx`{=tex} s_i R_i
-`\mathbf `{=tex}p_j\^V + `\mathbf `{=tex}t_i. \]
+$$
+\tilde{\mathbf{p}}_j^O
+\approx
+s_i R_i \mathbf{p}_j^V + \mathbf{t}_i.
+$$
 
 The fit uses a multi-frame Umeyama/Kabsch-style similarity alignment.
 
 The resulting scalar
 
-\[ `\boxed{s_i}`{=tex} \]
+$$
+\boxed{s_i}
+$$
 
 has units
 
-\[ `\mathrm{metres/raw\ VGGT\ unit}`{=tex}. \]
+$$
+\mathrm{metres/raw\ VGGT\ unit}.
+$$
 
 This is the quantity injected into the SLAM pipeline.
 
-The fitted (R_i) and (`\mathbf `{=tex}t_i) are retained only as fit
+The fitted $R_i$ and $\mathbf{t}_i$ are retained only as fit
 diagnostics. They are **not** used to place the submap in the Go2
 odometry frame.
 
@@ -242,18 +262,20 @@ performs visual inter-submap alignment**.
 
 ### Point geometry
 
-Every raw VGGT point is multiplied by (s_i):
+Every raw VGGT point is multiplied by $s_i$:
 
-\[ `\mathbf `{=tex}x\^{V,`\mathrm{metric}`{=tex}} = s_i
-`\mathbf `{=tex}x\^V. \]
+$$
+\mathbf{x}^{V,\mathrm{metric}} = s_i \mathbf{x}^V.
+$$
 
 ### Camera-pose translations
 
 The translation component of every raw VGGT camera pose is multiplied by
 the same factor:
 
-\[ `\mathbf `{=tex}t_j\^{V,`\mathrm{metric}`{=tex}} = s_i
-`\mathbf `{=tex}t_j\^V. \]
+$$
+\mathbf{t}_j^{V,\mathrm{metric}} = s_i \mathbf{t}_j^V.
+$$
 
 Camera rotations remain unchanged.
 
@@ -286,13 +308,15 @@ In particular, the preprocessing stage does **not**:
 
 Therefore:
 
-\[ `\boxed{\text{Go2 contributes local metric scale}}`{=tex} \]
+$$
+\boxed{\text{Go2 contributes local metric scale}}
+$$
 
 while
 
-\[
-`\boxed{\text{VGGT-SLAM remains responsible for visual map alignment}}`{=tex}
-\]
+$$
+\boxed{\text{VGGT-SLAM remains responsible for visual map alignment}}
+$$
 
 This prevents raw odometric position/orientation drift from directly
 determining the internal visual map geometry.
@@ -322,7 +346,9 @@ visual scale factor becomes a **residual correction**.
 
 Ideally,
 
-\[ s\_{`\mathrm{visual,residual}`{=tex}}`\approx 1`{=tex}. \]
+$$
+s_{\mathrm{visual,residual}} \approx 1.
+$$
 
 This is useful rather than redundant: the visual overlap acts as an
 independent consistency check and lets VGGT-SLAM reconcile remaining
@@ -350,7 +376,9 @@ If these checks fail, the metricization estimate is rejected.
 
 The preprocessing scale then remains
 
-\[ s_i=1, \]
+$$
+s_i = 1,
+$$
 
 so the submap enters the map at its raw VGGT scale.
 
@@ -396,7 +424,7 @@ The key quantities are:
 
 ### `raw_to_metric_scale_m_per_unit`
 
-The fitted local scale (s_i), in metres per raw VGGT unit.
+The fitted local scale $s_i$, in metres per raw VGGT unit.
 
 ### `fit_rmse_m` / `fit_max_error_m`
 
@@ -426,8 +454,9 @@ After visual inter-submap alignment and graph optimization, the
 resulting global map therefore has an **intended metric coordinate
 unit**:
 
-\[ `\boxed{1\ \text{map coordinate unit} \approx 1\ \text{metre}}`{=tex}
-\]
+$$
+\boxed{1\ \text{map coordinate unit} \approx 1\ \text{metre}}
+$$
 
 This should be described as **metricized** or **approximately metric**,
 not assumed to be metrically exact.
@@ -467,10 +496,12 @@ Go2 `odom`.
 
 This rigid frame transform contains only rotation and translation:
 
-\[ `\mathbf `{=tex}p\^{O} = R\_{OV}`\mathbf `{=tex}p\^{V_m} +
-`\mathbf `{=tex}t\_{OV}, \]
+$$
+\mathbf{p}^{O} =
+R_{OV}\mathbf{p}^{V_m} + \mathbf{t}_{OV},
+$$
 
-where (`\mathbf `{=tex}p\^{V_m}) is already metricized VGGT geometry.
+where $\mathbf{p}^{V_m}$ is already metricized VGGT geometry.
 
 No additional scale is fitted at this stage.
 
@@ -492,10 +523,14 @@ from the **first common synchronized optical-camera pose** between:
 
 Conceptually,
 
-\[ T\_{`\mathrm{odom}`{=tex}`\leftarrow`{=tex}`\mathrm{VGGT}`{=tex}} =
-T\_{`\mathrm{odom}`{=tex}`\leftarrow `{=tex}C_0} `\left`{=tex}(
-T\_{`\mathrm{VGGT}`{=tex}`\leftarrow `{=tex}C_0} `\right`{=tex})\^{-1}.
-\]
+$$
+T_{\mathrm{odom}\leftarrow\mathrm{VGGT}}
+=
+T_{\mathrm{odom}\leftarrow C_0}
+\left(
+T_{\mathrm{VGGT}\leftarrow C_0}
+\right)^{-1}.
+$$
 
 This transform is a rigid SE(3) transform.
 
@@ -743,7 +778,8 @@ unnecessarily:
 
 The current central architecture is:
 
-\[ `\boxed{
+$$
+\boxed{
 \text{raw arbitrary-scale VGGT submaps}
 \rightarrow
 \text{Go2 local metric scale}
@@ -755,4 +791,5 @@ The current central architecture is:
 \text{rigid alignment to Go2 odom}
 \rightarrow
 \text{planner}
-}`{=tex} \]
+}
+$$

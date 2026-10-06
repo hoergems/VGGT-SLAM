@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torchvision.transforms.functional import to_pil_image
 
+from vggt_interface import VGGTInterface
+
 import vggt_slam.slam_utils as utils
 from vggt_slam.sam3_utils import run_sam3_text_query
 from vggt_slam.solver import Solver
@@ -160,52 +162,6 @@ def restart_camera(camera, stop_event=None, retry_delay: float = 2.0):
     print("[Camera] Reconnection aborted (session cancelled).")
     return None
 
-
-def retain_fixed_window_overlap(records, overlap_size):
-    """Return the records retained after a completed fixed-policy submap."""
-    if overlap_size < 0:
-        raise ValueError("overlap_size must be non-negative")
-    return list(records[-overlap_size:]) if overlap_size > 0 else []
-
-
-def should_flush_final_fixed_window(num_records, completed_submaps, overlap_size):
-    """Whether an EOF fixed-policy buffer contains unprocessed keyframes."""
-    if num_records < 0 or completed_submaps < 0 or overlap_size < 0:
-        raise ValueError("record count, submap count, and overlap size must be non-negative")
-    if completed_submaps == 0:
-        return num_records > 0
-    return num_records > overlap_size
-
-
-def threaded_process_submap(keyframe_records, solver, model, args, clip_model, clip_preprocess, planning_map_snapshot=None):
-    """Background thread: run VGGT inference + graph optimisation for one submap."""
-    try:
-        image_names = [record.image_path for record in keyframe_records]
-        print(f"[SLAM] Processing submap ({len(keyframe_records)} frames)...")
-        predictions = solver.run_predictions(
-            image_names, model, args.max_loops, clip_model, clip_preprocess,
-            keyframe_records=keyframe_records,
-        )
-        with data_lock:
-            solver.add_points(predictions)
-            solver.graph.optimize()
-            if planning_map_snapshot is not None:
-                planning_map_snapshot.update(solver)
-            if args.vis_map:
-                if len(predictions.get("detected_loops", [])) > 0:
-                    solver.update_all_submap_vis()
-                else:
-                    solver.update_latest_submap_vis()
-        if args.vis_map_open3d:
-            map_updated_event.set()
-        print("[SLAM] Submap done.")
-    except Exception as e:
-        import traceback
-        print(f"[SLAM ERROR] {e}")
-        traceback.print_exc()
-    finally:
-        if solver_lock.locked():
-            solver_lock.release()
 
 
 def run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor):
@@ -378,9 +334,15 @@ def main():
     print("Camera ready.")
 
     frame_count = 0
-    keyframe_records = []
     target_size = args.submap_size + args.overlapping_window_size
-    submap_count = 0
+    vggt_interface = VGGTInterface(
+        solver, model, args, clip_model, clip_preprocess, planning_map_snapshot,
+        solver_lock=solver_lock, data_lock=data_lock,
+        map_updated_event=map_updated_event,
+    )
+    # Standalone compatibility: a planner can instead leave the interface
+    # paused and own resume_slam()/update_slam() around each action.
+    vggt_interface.resume_slam()
     last_status_frame = 0  # for console status throttle when display is off
     stop_event = threading.Event()
 
@@ -420,56 +382,32 @@ def main():
 
             frame_count += 1
 
-            selected_record = None
-            is_candidate = solver.flow_tracker.compute_disparity_candidate(
-                img, args.min_disparity, args.vis_flow
-            )
-            if is_candidate:
-                accepted = True
-                if args.keyframe_min_sharpness > 0.0:
-                    sharpness = compute_image_sharpness(img)
-                    accepted = sharpness >= args.keyframe_min_sharpness
-                    if not accepted:
-                        print(
-                            "\033[93m[Keyframe] Rejected blurry candidate: "
-                            f"sharpness={sharpness:.2f} < "
-                            f"threshold={args.keyframe_min_sharpness:.2f}\033[0m"
-                        )
-                if accepted:
-                    solver.flow_tracker.accept_keyframe(img)
-                    selected_record = save_keyframe(frame, args.keyframe_folder, frame_count)
-
-            if selected_record is not None:
-                keyframe_records.append(selected_record)
-            if len(keyframe_records) >= target_size:
-                if solver_lock.acquire(blocking=False):
-                    submap_count += 1
-                    print(f"[Main] Launching submap {submap_count} (frame {frame_count})...")
-                    go2_records = [record for record in keyframe_records if record.timestamp_ns is not None]
-                    if go2_records:
-                        print(
-                            f"[Main]   frames={len(keyframe_records)} "
-                            f"first_timestamp_ns={go2_records[0].timestamp_ns} "
-                            f"last_timestamp_ns={go2_records[-1].timestamp_ns} "
-                            f"metric_poses={sum(record.metric_pose is not None for record in go2_records)}/{len(go2_records)}"
-                        )
-                    t = threading.Thread(target=threaded_process_submap,
-                        args=(list(keyframe_records), solver, model, args, clip_model, clip_preprocess, planning_map_snapshot), daemon=True)
-                    t.start()
-                    keyframe_records = retain_fixed_window_overlap(
-                        keyframe_records, args.overlapping_window_size
+            with vggt_interface._frame_processing() as admitted:
+                if admitted:
+                    selected_record = None
+                    is_candidate = solver.flow_tracker.compute_disparity_candidate(
+                        img, args.min_disparity, args.vis_flow
                     )
-                else:
-                    # SLAM still busy; cap the backlog so we don't grow unbounded.
-                    if len(keyframe_records) > target_size * 2:
-                        num_dropped = len(keyframe_records) - target_size
-                        print(
-                            f"\033[93m[WARNING] Dropping {num_dropped} pending keyframe records "
-                            f"(backlog={len(keyframe_records)}, keeping={target_size})\033[0m"
-                        )
-                        keyframe_records = keyframe_records[-target_size:]
+                    if is_candidate:
+                        accepted = True
+                        if args.keyframe_min_sharpness > 0.0:
+                            sharpness = compute_image_sharpness(img)
+                            accepted = sharpness >= args.keyframe_min_sharpness
+                            if not accepted:
+                                print(
+                                    "\033[93m[Keyframe] Rejected blurry candidate: "
+                                    f"sharpness={sharpness:.2f} < "
+                                    f"threshold={args.keyframe_min_sharpness:.2f}\033[0m"
+                                )
+                        if accepted:
+                            solver.flow_tracker.accept_keyframe(img)
+                            selected_record = save_keyframe(frame, args.keyframe_folder, frame_count)
 
-            kf = len(keyframe_records)
+                    if selected_record is not None:
+                        vggt_interface.state.keyframe_records.append(selected_record)
+                    vggt_interface._launch_full_submap()
+                kf = len(vggt_interface.state.keyframe_records)
+                submap_count = vggt_interface.state.submap_count
             slam_busy = solver_lock.locked()
 
             if use_display:
@@ -505,25 +443,10 @@ def main():
         if use_display:
             cv2.destroyAllWindows()
 
-    # Wait for any in-flight submap to finish before final visualization/logging.
-    with solver_lock:
-        pass
-
-    # The fixed-policy buffer now cannot race an ordinary background launch.
-    # Reconstruct a short stream in full, or a tail containing new records in
-    # addition to the overlap retained by a previous ordinary submap.
-    if should_flush_final_fixed_window(
-        len(keyframe_records), submap_count, args.overlapping_window_size
-    ):
-        final_records = list(keyframe_records)
-        submap_count += 1
-        print(f"[Main] Flushing final partial submap ({len(final_records)} frames)...")
-        # Capture has ended, so running the existing path synchronously makes
-        # completion before final outputs explicit and deterministic.
-        solver_lock.acquire()
-        threaded_process_submap(
-            final_records, solver, model, args, clip_model, clip_preprocess, planning_map_snapshot
-        )
+    # EOF uses the same action barrier, including partial-tail publication.
+    vggt_interface.update_slam()
+    # Drop the interface's model reference before the optional SAM3 phase.
+    del vggt_interface
 
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())

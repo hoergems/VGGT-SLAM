@@ -1,3 +1,4 @@
+
 # VGGT-SLAM Metric Scaling: Updated High-Level Design
 
 ## Purpose
@@ -524,8 +525,7 @@ from the **first common synchronized optical-camera pose** between:
 Conceptually,
 
 $$
-T_{\mathrm{odom}\leftarrow\mathrm{VGGT}}
-=
+T_{\mathrm{odom}\leftarrow\mathrm{VGGT}} =
 T_{\mathrm{odom}\leftarrow C_0}
 \left(
 T_{\mathrm{VGGT}\leftarrow C_0}
@@ -793,3 +793,4 @@ $$
 \text{planner}
 }
 $$
+

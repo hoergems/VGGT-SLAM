@@ -4,7 +4,7 @@ import argparse
 import numpy as np
 import torch
 
-from vggt_interface import CameraDisconnectedError, VGGTInterface
+from vggt_slam.interface import CameraDisconnectedError, VGGTInterface
 
 from vggt_slam.sam3_utils import run_sam3_text_query
 from vggt_slam.cameras import BACKENDS

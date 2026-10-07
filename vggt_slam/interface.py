@@ -5,12 +5,12 @@ from dataclasses import dataclass, field
 import math
 import threading
 
-from vggt_slam.cameras import Go2ConnectionError
-from vggt_slam.realtime_io import (
+from .cameras import Go2ConnectionError
+from .realtime_io import (
     create_camera, reset_keyframe_folder, restart_camera, save_keyframe,
 )
 
-from vggt_slam.realtime_processing import (
+from .realtime_processing import (
     process_submap,
     retain_fixed_window_overlap,
     should_flush_final_fixed_window,
@@ -45,7 +45,7 @@ def validate_realtime_args(args):
 
 
 def _create_solver(**kwargs):
-    from vggt_slam.solver import Solver
+    from .solver import Solver
     return Solver(**kwargs)
 
 
@@ -61,7 +61,7 @@ def _load_model(args, device):
 
 
 def _create_snapshot(path):
-    from vggt_slam.incremental_odom_map import IncrementalOdomMapSnapshot
+    from .incremental_odom_map import IncrementalOdomMapSnapshot
     return IncrementalOdomMapSnapshot(path)
 
 
@@ -75,7 +75,7 @@ def _load_clip(args):
 
 
 def _create_viewer(**kwargs):
-    from vggt_slam.open3d_viewer import Open3DMapViewer
+    from .open3d_viewer import Open3DMapViewer
     return Open3DMapViewer(**kwargs)
 
 
@@ -289,7 +289,7 @@ class VGGTInterface:
             if tracker.compute_disparity_candidate(img, self.args.min_disparity, self.args.vis_flow):
                 accepted = True
                 if self.args.keyframe_min_sharpness > 0:
-                    from vggt_slam.frame_overlap import compute_image_sharpness
+                    from .frame_overlap import compute_image_sharpness
                     sharpness = compute_image_sharpness(img)
                     accepted = sharpness >= self.args.keyframe_min_sharpness
                     if not accepted:

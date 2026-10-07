@@ -1,23 +1,13 @@
-import os
-import shutil
 import time
-import threading
 import argparse
 
-import cv2
 import numpy as np
 import torch
-from torchvision.transforms.functional import to_pil_image
 
-from vggt_interface import VGGTInterface
+from vggt_interface import CameraDisconnectedError, VGGTInterface
 
-import vggt_slam.slam_utils as utils
 from vggt_slam.sam3_utils import run_sam3_text_query
-from vggt_slam.solver import Solver
-from vggt_slam.cameras import BACKENDS, CameraFrame, Go2Camera, Go2ConnectionError
-from vggt_slam.frame_metadata import KeyframeRecord
-from vggt_slam.frame_overlap import compute_image_sharpness
-from vggt_slam.open3d_viewer import Open3DMapViewer
+from vggt_slam.cameras import BACKENDS
 from vggt_slam.odom_map_alignment import (
     build_first_frame_odom_alignment,
     pose_matrix_from_position_quaternion,
@@ -26,14 +16,7 @@ from vggt_slam.odom_map_alignment import (
     trajectory_alignment_diagnostics,
     write_trajectory_alignment_csv,
 )
-from vggt_slam.incremental_odom_map import IncrementalOdomMapSnapshot
 
-from vggt.models.vggt import VGGT
-
-# --- Thread Safety Primitives ---
-solver_lock = threading.Lock()  # Ensures only one solver thread runs at a time
-data_lock = threading.Lock()    # Protects shared SLAM state (solver)
-map_updated_event = threading.Event()  # Signals the main thread that a new global map snapshot is ready
 
 parser = argparse.ArgumentParser(description="VGGT-SLAM RealSense live demo")
 parser.add_argument("--keyframe_folder", type=str, default="keyframes", help="Folder to save captured keyframes")
@@ -47,6 +30,7 @@ parser.add_argument("--vis_map_open3d", action="store_true", help="Visualize the
 parser.add_argument("--vis_imgs", action="store_true", help="Show camera images in the viser frustums. By default only the frustums are shown (faster visualization)")
 parser.add_argument("--vis_voxel_size", type=float, default=None, help="Voxel size for downsampling the point cloud in the viewer (e.g. 0.05 for 5 cm). Applies to both the viser and Open3D live viewers. Default: no downsampling")
 parser.add_argument("--vis_open3d_point_size", type=float, default=2.0, help="Open3D live-map render point size")
+parser.add_argument("--no_live_display", action="store_true", help="Disable the OpenCV live camera window")
 parser.add_argument("--vis_flow", action="store_true", help="Visualize optical flow from RAFT for keyframe selection")
 parser.add_argument("--run_os", action="store_true", help="Enable open-set semantic search with Perception Encoder CLIP and SAM3")
 parser.add_argument("--submap_size", type=int, default=16, help="Number of new frames per submap, does not include overlapping frames or loop closure frames")
@@ -80,92 +64,10 @@ parser.add_argument("--odom_aligned_map_output_path", type=str, default=None, he
 parser.add_argument("--planning_map_output_path", type=str, default=None, help="Write/replace the current complete graph-optimized map in Go2 odom after every ordinary-submap optimization (.ply only; requires Go2 metricization)")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def reset_keyframe_folder(keyframe_folder: str) -> None:
-    """Clear and recreate the configured keyframe output directory."""
-    if not keyframe_folder.strip():
-        raise ValueError("Keyframe folder path must not be empty")
-    if os.path.exists(keyframe_folder):
-        if not os.path.isdir(keyframe_folder):
-            raise ValueError(
-                f"Keyframe folder path exists but is not a directory: {keyframe_folder}"
-            )
-        shutil.rmtree(keyframe_folder)
-
-    os.makedirs(keyframe_folder, exist_ok=True)
-
-
-def save_keyframe(frame: CameraFrame, folder: str, frame_count: int) -> KeyframeRecord:
-    """Persist one keyframe while retaining its source identity and metadata."""
-    if frame.timestamp_ns is not None:
-        if not isinstance(frame.timestamp_ns, int):
-            raise TypeError("Go2 timestamp_ns must be an exact Python int")
-        filename = os.path.join(folder, f"{frame.timestamp_ns}.png")
-    else:
-        filename = os.path.join(folder, f"frame_{frame_count:06d}.png")
-    if not cv2.imwrite(filename, frame.image):
-        raise IOError(f"Failed to save keyframe to {filename}")
-    record = KeyframeRecord(
-        image_path=filename,
-        # This is the pre-existing local VGGT realtime identity, deliberately
-        # separate from the Go2 source timestamp used in the filename.
-        frame_id=frame_count,
-        timestamp_ns=frame.timestamp_ns,
-        metric_pose=frame.metric_pose,
-        sequence_id=frame.sequence_id,
-        imu_samples=frame.imu_samples,
-    )
-    if record.timestamp_ns is not None:
-        if record.metric_pose is None:
-            raise ValueError("Go2 keyframe metadata is incomplete or inconsistent")
-    return record
-
-
-def create_camera(args):
-    """Construct the configured camera backend, wiring Go2 TCP endpoint options."""
-    if args.camera == "go2":
-        return Go2Camera(
-            host=args.go2_host,
-            port=args.go2_port,
-            receive_timeout_s=args.go2_receive_timeout_s,
-        )
-    return BACKENDS[args.camera]()
-
-
-def restart_camera(camera, stop_event=None, retry_delay: float = 2.0):
-    """Stop and re-start the camera, retrying until a device is streaming again.
-
-    Used to recover from a mid-session disconnect (e.g. a RealSense USB drop),
-    where ``capture()`` raises. Honors ``stop_event`` so the user can still
-    cancel while a camera is unplugged. Returns the working camera object, or
-    None if aborted via stop_event.
-    """
-    try:
-        camera.stop()
-    except Exception:
-        pass  # device may already be gone; ignore teardown errors
-
-    attempt = 0
-    while stop_event is None or not stop_event.is_set():
-        attempt += 1
-        try:
-            camera.start()
-            print(f"[Camera] Reconnected after {attempt} attempt(s).")
-            return camera
-        except Exception as e:
-            print(f"[Camera] Reconnect attempt {attempt} failed: {e}.")
-            print(f"[Camera] Retrying in {retry_delay:.0f}s...")
-            time.sleep(retry_delay)
-    print("[Camera] Reconnection aborted (session cancelled).")
-    return None
-
-
-
 def run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor):
     """Interactive open-set semantic query loop, run after capture ends."""
+    from torchvision.transforms.functional import to_pil_image
+    import vggt_slam.slam_utils as utils
     while True:
         query = input("\nEnter text query or q to quit: ").strip()
         if len(query) == 0:
@@ -222,231 +124,32 @@ def run_semantic_query_loop(args, solver, clip_model, clip_tokenizer, processor)
 def main():
     args = parser.parse_args()
 
-    if args.overlapping_window_size < 0:
-        parser.error("--overlapping_window_size must be non-negative")
-    if args.vis_open3d_point_size <= 0:
-        parser.error("--vis_open3d_point_size must be greater than zero")
-    if args.vis_voxel_size is not None and args.vis_voxel_size <= 0:
-        parser.error("--vis_voxel_size must be greater than zero when provided")
-    if not np.isfinite(args.keyframe_min_sharpness) or args.keyframe_min_sharpness < 0:
-        parser.error("--keyframe_min_sharpness must be finite and non-negative")
-    if not np.isfinite(args.go2_odom_translation_scale) or args.go2_odom_translation_scale <= 0:
-        parser.error("--go2_odom_translation_scale must be finite and positive")
-    if args.planning_map_output_path is not None:
-        if not args.metricize_submaps_from_go2:
-            parser.error("--planning_map_output_path requires --metricize_submaps_from_go2")
-        if args.camera != "go2":
-            parser.error("--planning_map_output_path requires --camera go2")
-        if not args.planning_map_output_path.lower().endswith(".ply"):
-            parser.error("--planning_map_output_path supports .ply files only")
-    if args.metricize_submaps_from_go2:
-        print(f"[MetricSubmap] ENABLED: per-submap Go2 scale metricization, odom_translation_scale={args.go2_odom_translation_scale:.6f}")
-    print(f"[SubmapPolicy] policy=fixed new_frames={args.submap_size} overlap={args.overlapping_window_size} target_frames={args.submap_size + args.overlapping_window_size}")
-
-    reset_keyframe_folder(args.keyframe_folder)
-    print(f"[Keyframes] Cleared keyframe folder: {args.keyframe_folder}")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    # When --run_os is set, SAM3/decord loads its own libxcb which poisons
-    # OpenCV's XCB state and makes cv2.waitKey() hang. Skip cv2 display in that
-    # case and print periodic status to the console instead.
-    use_display = not args.run_os
-
-    solver = Solver(
-        init_conf_threshold=args.conf_threshold,
-        lc_thres=args.lc_thres,
-        vis_voxel_size=args.vis_voxel_size,
-        vis_imgs=args.vis_imgs,
-        metricize_submaps_from_go2=args.metricize_submaps_from_go2,
-        go2_odom_translation_scale=args.go2_odom_translation_scale,
-    )
-    planning_map_snapshot = (
-        IncrementalOdomMapSnapshot(args.planning_map_output_path)
-        if args.planning_map_output_path is not None else None
-    )
-
-    open3d_viewer = None
-    if args.vis_map_open3d:
-        open3d_viewer = Open3DMapViewer(
-            point_size=args.vis_open3d_point_size,
-            voxel_size=args.vis_voxel_size,
-        )
-        open3d_viewer.start()
-
-    print("Initializing and loading VGGT model...")
-
-    if args.run_os:
-        import core.vision_encoder.pe as pe
-        import core.vision_encoder.transforms as transforms
-
-        clip_model = pe.CLIP.from_config("PE-Core-L14-336", pretrained=True)  # Downloads from HF
-        clip_model = clip_model.cuda()
-        clip_tokenizer = transforms.get_text_tokenizer(clip_model.context_length)
-        clip_preprocess = transforms.get_image_transform(clip_model.image_size)
-        processor = None
-    else:
-        clip_model, clip_preprocess = None, None
-        clip_tokenizer, processor = None, None
-
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-
-    model.eval()
-    model = model.to(torch.bfloat16)  # use half precision
-    model = model.to(device)
-    print("All models loaded. Starting SLAM loop.")
-
-    # --- Camera setup ---
-    camera = create_camera(args)
-    print(f"Initializing {args.camera} camera...")
-    camera.start()
-
-    # Warm up the camera — first few frames can be None
-    print("Waiting for first camera frame...")
-    first_frame = None
-    go2_disconnected_before_first_frame = False
-    while first_frame is None:
-        try:
-            first_frame = camera.capture()
-        except Go2ConnectionError as e:
-            if args.go2_exit_on_disconnect:
-                print(f"[Go2] Disconnected before first frame ({e}). Exiting (--go2_exit_on_disconnect).")
-                go2_disconnected_before_first_frame = True
-                break
-            print(f"[Camera] Error during warm-up ({e}). Reconnecting...")
-            camera = restart_camera(camera)
-        except Exception as e:
-            print(f"[Camera] Error during warm-up ({e}). Reconnecting...")
-            camera = restart_camera(camera)
-
-    if go2_disconnected_before_first_frame:
-        camera.stop()
-        if open3d_viewer is not None:
-            open3d_viewer.close()
-        return
-
-    if use_display:
-        cv2.imshow("VGGT-SLAM Live", first_frame.image)
-        cv2.waitKey(1)
-    print("Camera ready.")
-
-    frame_count = 0
-    target_size = args.submap_size + args.overlapping_window_size
-    vggt_interface = VGGTInterface(
-        solver, model, args, clip_model, clip_preprocess, planning_map_snapshot,
-        solver_lock=solver_lock, data_lock=data_lock,
-        map_updated_event=map_updated_event,
-    )
-    # Standalone compatibility: a planner can instead leave the interface
-    # paused and own resume_slam()/update_slam() around each action.
-    vggt_interface.resume_slam()
-    last_status_frame = 0  # for console status throttle when display is off
-    stop_event = threading.Event()
-
-    pending_frame = first_frame
+    try:
+        slam = VGGTInterface(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     try:
-        while True:
-            if stop_event.is_set():
-                break
-
-            if pending_frame is not None:
-                frame = pending_frame
-                pending_frame = None
-            else:
-                try:
-                    frame = camera.capture()
-                except Go2ConnectionError as e:
-                    if args.go2_exit_on_disconnect:
-                        print(f"[Go2] Disconnected ({e}). Exiting capture loop (--go2_exit_on_disconnect).")
-                        break
-                    print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
-                    camera = restart_camera(camera, stop_event)
-                    if camera is None:  # session cancelled while reconnecting
-                        break
-                    continue
-                except Exception as e:
-                    print(f"[Camera] Lost connection ({e}). Attempting to reconnect...")
-                    camera = restart_camera(camera, stop_event)
-                    if camera is None:  # session cancelled while reconnecting
-                        break
-                    continue
-
-            if frame is None:
-                continue
-
-            img = frame.image
-
-            frame_count += 1
-
-            with vggt_interface._frame_processing() as admitted:
-                if admitted:
-                    selected_record = None
-                    is_candidate = solver.flow_tracker.compute_disparity_candidate(
-                        img, args.min_disparity, args.vis_flow
-                    )
-                    if is_candidate:
-                        accepted = True
-                        if args.keyframe_min_sharpness > 0.0:
-                            sharpness = compute_image_sharpness(img)
-                            accepted = sharpness >= args.keyframe_min_sharpness
-                            if not accepted:
-                                print(
-                                    "\033[93m[Keyframe] Rejected blurry candidate: "
-                                    f"sharpness={sharpness:.2f} < "
-                                    f"threshold={args.keyframe_min_sharpness:.2f}\033[0m"
-                                )
-                        if accepted:
-                            solver.flow_tracker.accept_keyframe(img)
-                            selected_record = save_keyframe(frame, args.keyframe_folder, frame_count)
-
-                    if selected_record is not None:
-                        vggt_interface.state.keyframe_records.append(selected_record)
-                    vggt_interface._launch_full_submap()
-                kf = len(vggt_interface.state.keyframe_records)
-                submap_count = vggt_interface.state.submap_count
-            slam_busy = solver_lock.locked()
-
-            if use_display:
-                display = img.copy()
-                status = f"KFs: {kf}/{target_size}  Submaps: {submap_count}"
-                if slam_busy:
-                    status += "  [SLAM running]"
-                cv2.putText(display, status, (8, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.imshow("VGGT-SLAM Live", display)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+        slam.resume_slam()
+        try:
+            while slam.is_alive and not slam.quit_requested:
+                if slam.get_status().faulted:
                     break
-            else:
-                if frame_count - last_status_frame >= 30:
-                    busy_str = "  [SLAM running]" if slam_busy else ""
-                    print(f"[Camera] frame={frame_count}  KFs={kf}/{target_size} submaps={submap_count}{busy_str}")
-                    last_status_frame = frame_count
-
-            if open3d_viewer is not None and open3d_viewer.is_active:
-                if map_updated_event.is_set():
-                    map_updated_event.clear()
-                    with data_lock:
-                        point_cloud = solver.get_global_point_cloud()
-                    open3d_viewer.update(point_cloud)
-                else:
-                    open3d_viewer.poll()
-
-    except KeyboardInterrupt:
-        print("\n[Main] Shutting down...")
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            print("\n[Main] Shutting down...")
     finally:
-        if camera is not None:
-            camera.stop()
-        if use_display:
-            cv2.destroyAllWindows()
+        # Shutdown uses the same action barrier and commits the partial tail.
+        try:
+            slam.close()
+        except CameraDisconnectedError as exc:
+            # One-shot replay EOF still commits its accepted tail and exports.
+            print(f"[Go2] {exc}")
 
-    # EOF uses the same action barrier, including partial-tail publication.
-    vggt_interface.update_slam()
-    # Drop the interface's model reference before the optional SAM3 phase.
-    del vggt_interface
+    solver = slam.solver
+    planning_map_snapshot = slam.planning_map_snapshot
+    data_lock = slam.data_lock
+    clip_model, clip_tokenizer = slam.clip_model, slam.clip_tokenizer
 
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())
@@ -455,18 +158,11 @@ def main():
         # just show the map after all submaps have been processed
         solver.update_all_submap_vis()
 
-    if open3d_viewer is not None and open3d_viewer.is_active:
-        with data_lock:
-            point_cloud = solver.get_global_point_cloud()
-        open3d_viewer.update(point_cloud)
-
     if args.run_os:
         # Mapping is complete and no future submap can use VGGT. Release it
         # before SAM3 construction so the two large models never coexist.
         print("Releasing VGGT model before loading SAM3...")
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        slam.release_vggt_model()
 
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
@@ -558,9 +254,6 @@ def main():
         solver.map.write_poses_to_file(args.log_path, solver.graph, kitti_format=False)
         if not args.skip_dense_log:
             solver.map.write_points_to_file(solver.graph, args.log_path.replace(".txt", "_points.pcd"))
-
-    if open3d_viewer is not None:
-        open3d_viewer.close()
 
 
 if __name__ == "__main__":
